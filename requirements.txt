@@ -1,0 +1,9 @@
+openai-whisper
+customtkinter
+pyaudio
+keyboard
+pyperclip
+torch
+torchaudio
+soundfile
+numpy
