@@ -12,6 +12,7 @@ import math
 import struct
 import torch
 import warnings
+from queue import Queue, Empty
 from datetime import datetime
 import torchaudio
 import soundfile as sf
@@ -131,6 +132,8 @@ class WhisperWidget(ctk.CTk):
         self.is_processing = False
         self.is_muted = False  # New Mute State
         self.audio_frames = []
+        self.ui_queue = Queue()
+        self.shutdown_event = threading.Event()
         self.p = pyaudio.PyAudio()
         self.stream = None
         self.temp_filename = "temp_recording.wav"
@@ -165,8 +168,15 @@ class WhisperWidget(ctk.CTk):
         self.bind("<space>", lambda event: self.toggle_recording())
         self.bind("m", lambda event: self.toggle_mute())  # Bind M for Mute
         
+        # Keep UI updates and topmost behavior stable over long sessions
+        self.after(50, self.process_ui_queue)
+        self.after(2000, self.maintain_topmost)
+        self.bind("<FocusOut>", lambda _event: self.reassert_topmost())
+        self.bind("<Map>", lambda _event: self.reassert_topmost())
+
         # Start Global Hotkey Listener
-        threading.Thread(target=self.listen_for_hotkey, daemon=True).start()
+        self.register_hotkey()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def start_drag(self, event):
         self.x = event.x
@@ -198,17 +208,59 @@ class WhisperWidget(ctk.CTk):
             device = "cuda:1" if torch.cuda.is_available() else "cpu"
             print(f"Loading model on {device}...")
             self.model = whisper.load_model(MODEL_SIZE, device=device)
-            self.update_ui_state("ready")
+            self.ui_call(self.update_ui_state, "ready")
             print("Model loaded.")
             self.play_sound(1000, 100)
         except Exception as e:
-            self.status_label.configure(text="Error Loading")
+            self.ui_call(self.status_label.configure, text="Error Loading")
             print(f"Error loading model: {e}")
 
-    def listen_for_hotkey(self):
-        """Global hotkey listener."""
-        keyboard.add_hotkey(HOTKEY, self.toggle_recording)
-        keyboard.wait() # Blocks this thread specifically
+    def ui_call(self, fn, *args, **kwargs):
+        """Runs UI work on the Tk main thread."""
+        if threading.current_thread() is threading.main_thread():
+            fn(*args, **kwargs)
+            return
+        self.ui_queue.put((fn, args, kwargs))
+
+    def process_ui_queue(self):
+        """Drains queued UI actions from background threads."""
+        while True:
+            try:
+                fn, args, kwargs = self.ui_queue.get_nowait()
+            except Empty:
+                break
+            try:
+                fn(*args, **kwargs)
+            except Exception as e:
+                print(f"UI queue callback failed: {e}")
+
+        if not self.shutdown_event.is_set():
+            self.after(50, self.process_ui_queue)
+
+    def reassert_topmost(self):
+        try:
+            self.attributes("-topmost", True)
+            self.lift()
+        except Exception as e:
+            print(f"Topmost reassert failed: {e}")
+
+    def maintain_topmost(self):
+        """Periodically reassert topmost so long-running sessions stay pinned."""
+        if self.shutdown_event.is_set():
+            return
+        self.reassert_topmost()
+        self.after(10000, self.maintain_topmost)
+
+    def on_hotkey_pressed(self):
+        self.ui_call(self.toggle_recording)
+
+    def register_hotkey(self):
+        try:
+            keyboard.add_hotkey(HOTKEY, self.on_hotkey_pressed)
+            print(f"Global hotkey registered: {HOTKEY.upper()}")
+        except Exception as e:
+            self.ui_call(self.status_label.configure, text="Hotkey Error")
+            print(f"Hotkey registration failed: {e}")
 
     def play_sound(self, freq, duration):
         """Plays sound if not muted using PyAudio (generates sine wave)."""
@@ -268,6 +320,10 @@ class WhisperWidget(ctk.CTk):
 
     def toggle_recording(self):
         """Main toggle logic."""
+        if threading.current_thread() is not threading.main_thread():
+            self.ui_call(self.toggle_recording)
+            return
+
         if self.model is None:
             return # Model not loaded yet
 
@@ -301,8 +357,14 @@ class WhisperWidget(ctk.CTk):
 
     def record_loop(self):
         while self.is_recording:
-            data = self.stream.read(CHUNK_SIZE)
-            self.audio_frames.append(data)
+            try:
+                data = self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                self.audio_frames.append(data)
+            except Exception as e:
+                print(f"Record loop error: {e}")
+                if self.is_recording:
+                    self.ui_call(self.stop_recording)
+                break
 
     def stop_recording(self):
         self.is_recording = False
@@ -331,8 +393,7 @@ class WhisperWidget(ctk.CTk):
             wf.close()
         except Exception as e:
             print(f"Error saving WAV: {e}")
-            self.is_processing = False
-            self.update_ui_state("ready")
+            self.ui_call(self.finish_processing)
             return
 
         # -------- VAD FIRST (CPU) --------
@@ -380,7 +441,7 @@ class WhisperWidget(ctk.CTk):
                         self.log_transcription(text)
 
                         # Success Notification
-                        self.record_btn.configure(text="COPIED", fg_color="#1565c0")
+                        self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
                         self.play_sound(1000, 100)
                         self.play_sound(1500, 100)
                         time.sleep(1) 
@@ -395,8 +456,7 @@ class WhisperWidget(ctk.CTk):
                     print(f"Attempt {attempt} failed: {e}")
                     time.sleep(0.5) # Brief pause before retry
 
-        self.is_processing = False
-        self.update_ui_state("ready")
+        self.ui_call(self.finish_processing)
 
         # Cleanup Logic
         if success:
@@ -421,6 +481,26 @@ class WhisperWidget(ctk.CTk):
                         pass
             except Exception as e:
                 print(f"Could not save backup file: {e}")
+
+    def finish_processing(self):
+        self.is_processing = False
+        self.update_ui_state("ready")
+
+    def on_close(self):
+        self.shutdown_event.set()
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception as e:
+            print(f"Hotkey cleanup failed: {e}")
+        try:
+            if self.stream:
+                self.stream.stop_stream()
+                self.stream.close()
+                self.stream = None
+            self.p.terminate()
+        except Exception as e:
+            print(f"Audio cleanup failed: {e}")
+        self.destroy()
 
 if __name__ == "__main__":
     app = WhisperWidget()
