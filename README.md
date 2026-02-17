@@ -11,6 +11,8 @@ A standalone, always-on-top desktop widget for instant speech-to-text transcript
   - **VAD (Voice Activity Detection):** Uses Silero VAD to strip silence before processing, improving accuracy and speed.
   - **Retry Logic:** Automatically retries transcription if it fails.
 - **Logs:** Saves daily transcription logs to the `transcriptions` folder.
+  - Runtime event diagnostics are also written to `event_log.txt` in the project root (no transcription text is stored there).
+  - On Windows the event log file is marked hidden. View it with `Get-Content -Force .\\event_log.txt`.
 
 ## Setup
 1. Install dependencies:
@@ -23,6 +25,23 @@ A standalone, always-on-top desktop widget for instant speech-to-text transcript
    ```bash
    python whisper_widget.py
    ```
+
+### Recommended Windows launch flow (venv isolated)
+Use the included launcher to keep this app isolated from system Python package drift:
+```bat
+launch_whisper_widget.bat
+```
+On first run it creates `.venv`, installs pinned dependencies from `requirements.txt`, then launches the app.
+`requirements.txt` is pinned to the CUDA 12.1 PyTorch wheels used by this project.
+Note: the virtual environment folder name is `.venv` (with a leading dot), not `venv`.
+
+If you want to install manually in the same way as the launcher:
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip "setuptools<81"
+python -m pip install --no-build-isolation -r requirements.txt
+```
 
 ## Controls
 - **Click & Drag:** Move the widget.
