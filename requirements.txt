@@ -9,3 +9,4 @@ torch==2.5.1+cu121
 torchaudio==2.5.1+cu121
 soundfile==0.13.1
 numpy==1.26.4
+noisereduce==3.0.3

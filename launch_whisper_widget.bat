@@ -18,7 +18,7 @@ if not exist "%PYTHON_EXE%" (
 if not exist "%PYTHON_EXE%" goto :error
 
 echo [setup] Checking required packages...
-"%PYTHON_EXE%" -c "import importlib.metadata as m, customtkinter, whisper, pyaudio, keyboard, pyperclip, torch, torchaudio, soundfile, numpy; m.version('openai-whisper')" >nul 2>nul
+"%PYTHON_EXE%" -c "import importlib.metadata as m, customtkinter, whisper, pyaudio, keyboard, pyperclip, torch, torchaudio, soundfile, numpy, noisereduce; m.version('openai-whisper')" >nul 2>nul
 if not %ERRORLEVEL% EQU 0 (
     echo [setup] Installing or repairing dependencies...
     "%PYTHON_EXE%" -m pip install --upgrade pip "setuptools<81" || goto :error
