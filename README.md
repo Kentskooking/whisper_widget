@@ -8,11 +8,14 @@ A standalone, always-on-top desktop widget for instant speech-to-text transcript
 - **Drag & Drop:** Click and drag the widget to position it anywhere.
 - **Auto Copy:** Transcription is automatically copied to your clipboard.
 - **Smart Transcription:**
-  - **VAD (Voice Activity Detection):** Uses Silero VAD to strip silence before processing, improving accuracy and speed.
-  - **Retry Logic:** Automatically retries transcription if it fails.
-- **Logs:** Saves daily transcription logs to the `transcriptions` folder.
-  - Runtime event diagnostics are also written to `event_log.txt` in the project root (no transcription text is stored there).
-  - On Windows the event log file is marked hidden. View it with `Get-Content -Force .\\event_log.txt`.
+  - **VAD First:** Uses Silero VAD on the raw recording to isolate speech before heavier processing.
+  - **Speech Cleanup:** Applies chunked `noisereduce` denoising and conservative peak normalization to the speech-only audio before Whisper.
+  - **Progressive Fallbacks:** Falls back across processed speech-only audio and raw full-audio transcription attempts if needed.
+- **Transcription Logs:** Saves daily transcription logs to the `transcriptions` folder.
+- **Debug Audio Capture:** Saves `raw.wav`, `speech_only.wav`, `denoised.wav`, and `normalized.wav` in timestamped folders under `debug_audio/` for comparison and model testing.
+- **Runtime Event Logs:** Writes runtime diagnostics to `event_log.txt` in the project root without storing transcription text.
+  - The active log rotates at 5 MB and retains `event_log.1.txt` and `event_log.2.txt`.
+  - On Windows the active log and rotated archives are marked hidden. View them with `Get-Content -Force .\\event_log.txt`.
 
 ## Setup
 1. Install dependencies:
@@ -51,6 +54,10 @@ python -m pip install --no-build-isolation -r requirements.txt
 
 ## Configuration
 You can edit the `Configuration` section at the top of `whisper_widget.py` to change:
-- `MODEL_SIZE` (default: `large-v3`) - Change to `base`, `small`, or `medium` for faster performance on lower-end hardware.
+- `MODEL_SIZE` (default: `large-v3`) - Common alternatives to test are `turbo` and `medium`.
 - `HOTKEY` (default: `f8`) - Change global shortcut.
 - `CUDA_VISIBLE_DEVICES` - Adjust GPU targeting if you have multiple GPUs.
+- `NOISE_REDUCTION_ENABLED`, `NOISE_REDUCTION_PROP_DECREASE`, `NOISE_REDUCTION_CHUNK_SECONDS`, `NOISE_REDUCTION_PADDING_SECONDS`, `NOISE_REDUCTION_N_FFT` - Tune denoising behavior and long-recording stability.
+- `NORMALIZE_AUDIO_ENABLED`, `NORMALIZE_TARGET_PEAK_DBFS`, `NORMALIZE_MAX_GAIN_DB` - Tune conservative peak normalization after denoise.
+- `SAVE_DEBUG_AUDIO` - Keep or disable timestamped debug audio capture under `debug_audio/`.
+- `EVENT_LOG_MAX_BYTES`, `EVENT_LOG_BACKUP_COUNT` - Control event log rotation size and retained archives.
