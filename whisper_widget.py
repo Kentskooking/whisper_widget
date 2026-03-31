@@ -8,9 +8,11 @@ import wave
 import threading
 import time
 import sys
+import shutil
 import pyperclip
 import math
 import struct
+import numpy as np
 import torch
 import warnings
 from queue import Queue, Empty
@@ -18,6 +20,10 @@ from ctypes import wintypes
 from datetime import datetime
 import torchaudio
 import soundfile as sf
+try:
+    import noisereduce as nr
+except Exception:
+    nr = None
 
 try:
     import keyboard
@@ -35,6 +41,24 @@ CHANNELS = 1
 CHUNK_SIZE = 1024
 LOG_DIR = "transcriptions"
 EVENT_LOG_FILE = "event_log.txt"
+EVENT_LOG_MAX_BYTES = 5 * 1024 * 1024
+EVENT_LOG_BACKUP_COUNT = 2
+EVENT_LOG_HEADER = "timestamp | event | details\n"
+DEBUG_AUDIO_DIR = "debug_audio"
+SAVE_DEBUG_AUDIO = True
+WHISPER_LANGUAGE = "en"
+WHISPER_NO_SPEECH_THRESHOLD = None
+VAD_PAD_MS = 400
+VAD_MIN_SPEECH_MS = 150
+VAD_MERGE_GAP_MS = 600
+NOISE_REDUCTION_ENABLED = True
+NOISE_REDUCTION_PROP_DECREASE = 0.85
+NOISE_REDUCTION_CHUNK_SECONDS = 10.0
+NOISE_REDUCTION_PADDING_SECONDS = 2.0
+NOISE_REDUCTION_N_FFT = 512
+NORMALIZE_AUDIO_ENABLED = True
+NORMALIZE_TARGET_PEAK_DBFS = -4.0
+NORMALIZE_MAX_GAIN_DB = 14.0
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -158,31 +182,77 @@ def parse_hotkey_for_win32(hotkey: str):
 
 class EventLogger:
     """Thread-safe event logger for runtime diagnostics."""
-    def __init__(self, path: str):
+    def __init__(self, path: str, max_bytes: int = EVENT_LOG_MAX_BYTES, backup_count: int = EVENT_LOG_BACKUP_COUNT):
         self.path = path
+        self.max_bytes = max_bytes
+        self.backup_count = max(0, backup_count)
         self._lock = threading.Lock()
         self._enabled = True
         self._initialize()
 
     def _initialize(self):
         try:
-            with open(self.path, "a", encoding="utf-8"):
-                pass
-            if os.path.getsize(self.path) == 0:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write("timestamp | event | details\n")
+            with self._lock:
+                self._ensure_log_file_locked()
         except Exception as e:
             self._enabled = False
             print(f"Event log init failed: {e}")
             return
 
+    def _archive_path(self, index: int) -> str:
+        root, ext = os.path.splitext(self.path)
+        return f"{root}.{index}{ext}"
+
+    def _apply_hidden_attribute(self, target_path: str):
         if IS_WINDOWS:
             try:
-                attrs = kernel32.GetFileAttributesW(self.path)
+                attrs = kernel32.GetFileAttributesW(target_path)
                 if attrs != INVALID_FILE_ATTRIBUTES and not (attrs & FILE_ATTRIBUTE_HIDDEN):
-                    kernel32.SetFileAttributesW(self.path, attrs | FILE_ATTRIBUTE_HIDDEN)
+                    kernel32.SetFileAttributesW(target_path, attrs | FILE_ATTRIBUTE_HIDDEN)
             except Exception as e:
                 print(f"Event log hide flag failed: {e}")
+
+    def _write_header_locked(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(EVENT_LOG_HEADER)
+        self._apply_hidden_attribute(self.path)
+
+    def _rotate_locked(self):
+        if self.backup_count > 0:
+            oldest_archive = self._archive_path(self.backup_count)
+            if os.path.exists(oldest_archive):
+                os.remove(oldest_archive)
+
+            for index in range(self.backup_count - 1, 0, -1):
+                archive_path = self._archive_path(index)
+                next_archive_path = self._archive_path(index + 1)
+                if os.path.exists(archive_path):
+                    os.replace(archive_path, next_archive_path)
+                    self._apply_hidden_attribute(next_archive_path)
+
+            if os.path.exists(self.path):
+                first_archive_path = self._archive_path(1)
+                os.replace(self.path, first_archive_path)
+                self._apply_hidden_attribute(first_archive_path)
+        elif os.path.exists(self.path):
+            os.remove(self.path)
+
+        self._write_header_locked()
+
+    def _ensure_log_file_locked(self):
+        if os.path.exists(self.path) and os.path.getsize(self.path) > self.max_bytes:
+            self._rotate_locked()
+            return
+
+        if not os.path.exists(self.path):
+            self._write_header_locked()
+            return
+
+        if os.path.getsize(self.path) == 0:
+            self._write_header_locked()
+            return
+
+        self._apply_hidden_attribute(self.path)
 
     def log(self, event: str, **fields):
         if not self._enabled:
@@ -204,6 +274,10 @@ class EventLogger:
 
         try:
             with self._lock:
+                self._ensure_log_file_locked()
+                current_size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+                if current_size + len(line.encode("utf-8")) > self.max_bytes:
+                    self._rotate_locked()
                 with open(self.path, "a", encoding="utf-8") as f:
                     f.write(line)
         except Exception as e:
@@ -284,13 +358,82 @@ def vad_extract_speech_only(
     total_samples = sum(seg["end"] - seg["start"] for seg in merged)
     return total_samples / sample_rate
 
+
+def reduce_noise_wav(
+    in_wav_path: str,
+    out_wav_path: str,
+    prop_decrease: float = 0.85,
+    chunk_seconds: float = 10.0,
+    padding_seconds: float = 2.0,
+    n_fft: int = 512,
+):
+    """Writes a denoised mono WAV for Whisper preprocessing."""
+    if nr is None:
+        raise RuntimeError("noisereduce is not installed")
+
+    audio, sample_rate = sf.read(in_wav_path, dtype="float32")
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+
+    chunk_size = max(n_fft, int(sample_rate * chunk_seconds))
+    padding = max(n_fft, int(sample_rate * padding_seconds))
+
+    reduced_audio = nr.reduce_noise(
+        y=audio,
+        sr=sample_rate,
+        stationary=False,
+        prop_decrease=prop_decrease,
+        chunk_size=chunk_size,
+        padding=padding,
+        n_fft=n_fft,
+    )
+    sf.write(out_wav_path, reduced_audio, sample_rate, subtype="PCM_16")
+
+
+def normalize_wav(
+    in_wav_path: str,
+    out_wav_path: str,
+    target_peak_dbfs: float = -4.0,
+    max_gain_db: float = 10.0,
+):
+    """Writes a conservatively peak-normalized mono WAV."""
+    audio, sample_rate = sf.read(in_wav_path, dtype="float32")
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak <= 1e-6:
+        sf.write(out_wav_path, audio, sample_rate, subtype="PCM_16")
+        return {
+            "gain_db": 0.0,
+            "input_peak_dbfs": float("-inf"),
+            "output_peak_dbfs": float("-inf"),
+        }
+
+    target_peak = 10 ** (target_peak_dbfs / 20.0)
+    max_gain = 10 ** (max_gain_db / 20.0)
+    gain = min(max_gain, max(1.0, target_peak / peak))
+    normalized_audio = np.clip(audio * gain, -0.999, 0.999)
+    output_peak = float(np.max(np.abs(normalized_audio))) if normalized_audio.size else 0.0
+    sf.write(out_wav_path, normalized_audio, sample_rate, subtype="PCM_16")
+
+    return {
+        "gain_db": 20.0 * math.log10(max(gain, 1e-12)),
+        "input_peak_dbfs": 20.0 * math.log10(max(peak, 1e-12)),
+        "output_peak_dbfs": 20.0 * math.log10(max(output_peak, 1e-12)),
+    }
+
 class WhisperWidget(ctk.CTk):
     def __init__(self):
         super().__init__()
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
         
         # Ensure Log Directory Exists
         os.makedirs(LOG_DIR, exist_ok=True)
-        self.event_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), EVENT_LOG_FILE)
+        self.event_log_path = os.path.join(self.base_dir, EVENT_LOG_FILE)
+        self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
+        if SAVE_DEBUG_AUDIO:
+            os.makedirs(self.debug_audio_dir, exist_ok=True)
         self.event_logger = EventLogger(self.event_log_path)
         self.log_event(
             "app_start",
@@ -334,7 +477,10 @@ class WhisperWidget(ctk.CTk):
         self.hotkey_ready_event = threading.Event()
         self.p = pyaudio.PyAudio()
         self.stream = None
+        self.sound_lock = threading.Lock()
         self.temp_filename = "temp_recording.wav"
+        self.temp_denoised_filename = "temp_denoised.wav"
+        self.temp_normalized_filename = "temp_normalized.wav"
         self.temp_speech_filename = "temp_speech_only.wav"
         self.log_event("audio_init_ok")
         
@@ -617,37 +763,128 @@ class WhisperWidget(ctk.CTk):
         self.log_event("hotkey_unregistered", mode="win32_or_none")
 
     def play_sound(self, freq, duration):
-        """Plays sound if not muted using PyAudio (generates sine wave)."""
-        if not self.is_muted:
-            try:
-                duration_ms = duration  # Duration is passed in ms
-                rate = 44100
-                
-                # Generate Sine Wave
-                num_samples = int(rate * (duration_ms / 1000.0))
-                audio_data = []
-                for x in range(num_samples):
-                    sample = 0.38 * math.sin(2 * math.pi * freq * (x / rate)) # 0.38 amplitude
-                    # Pack as 16-bit PCM (little endian)
-                    packed_sample = struct.pack('<h', int(sample * 32767.0))
-                    audio_data.append(packed_sample)
-                
-                byte_stream = b''.join(audio_data)
+        """Queues a non-blocking notification tone."""
+        self.play_sound_sequence([(freq, duration)])
 
-                # Play Stream
-                stream = self.p.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=rate,
-                    output=True
-                )
-                stream.write(byte_stream)
-                stream.stop_stream()
-                stream.close()
+    def play_sound_sequence(self, tones):
+        if self.is_muted:
+            return
 
-            except Exception as e:
-                print(f"Sound Error: {e}")
-                self.log_event("sound_error", error=e)
+        threading.Thread(
+            target=self._play_sound_sequence_sync,
+            args=(list(tones),),
+            daemon=True
+        ).start()
+
+    def _play_sound_sequence_sync(self, tones):
+        try:
+            with self.sound_lock:
+                for freq, duration in tones:
+                    duration_ms = duration
+                    rate = 44100
+
+                    num_samples = int(rate * (duration_ms / 1000.0))
+                    audio_data = []
+                    for x in range(num_samples):
+                        sample = 0.38 * math.sin(2 * math.pi * freq * (x / rate))
+                        packed_sample = struct.pack('<h', int(sample * 32767.0))
+                        audio_data.append(packed_sample)
+
+                    byte_stream = b''.join(audio_data)
+
+                    stream = self.p.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=rate,
+                        output=True
+                    )
+                    stream.write(byte_stream)
+                    stream.stop_stream()
+                    stream.close()
+        except Exception as e:
+            print(f"Sound Error: {e}")
+            self.log_event("sound_error", error=e)
+
+    def build_transcribe_attempts(self, speech_secs, processed_source):
+        base_options = {
+            "condition_on_previous_text": False,
+            "language": WHISPER_LANGUAGE,
+            "logprob_threshold": -1.0,
+            "no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
+        }
+        attempt_candidates = []
+
+        if speech_secs > 0.0 and processed_source:
+            attempt_candidates.append(("speech_only_primary", processed_source, {}))
+            if processed_source != self.temp_denoised_filename and os.path.exists(self.temp_denoised_filename):
+                attempt_candidates.append(("speech_only_denoised_fallback", self.temp_denoised_filename, {}))
+            if processed_source != self.temp_speech_filename and os.path.exists(self.temp_speech_filename):
+                attempt_candidates.append(("speech_only_raw_fallback", self.temp_speech_filename, {}))
+
+        attempt_candidates.append(("raw_full_fallback", self.temp_filename, {}))
+        attempt_candidates.append((
+            "raw_full_permissive",
+            self.temp_filename,
+            {
+                "compression_ratio_threshold": None,
+                "logprob_threshold": None,
+                "no_speech_threshold": None,
+            }
+        ))
+
+        attempts = []
+        seen = set()
+        for label, path, overrides in attempt_candidates:
+            if not path or not os.path.exists(path):
+                continue
+
+            signature = (
+                os.path.abspath(path),
+                tuple(sorted((key, repr(value)) for key, value in overrides.items())),
+            )
+            if signature in seen:
+                continue
+
+            seen.add(signature)
+            options = dict(base_options)
+            options.update(overrides)
+            attempts.append({
+                "label": label,
+                "path": path,
+                "options": options,
+            })
+
+        return attempts
+
+    def save_debug_audio_files(self):
+        if not SAVE_DEBUG_AUDIO:
+            return
+
+        capture_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        capture_dir = os.path.join(self.debug_audio_dir, capture_id)
+        saved_files = 0
+
+        try:
+            os.makedirs(capture_dir, exist_ok=False)
+            for source_path, output_name in [
+                (self.temp_filename, "raw.wav"),
+                (self.temp_denoised_filename, "denoised.wav"),
+                (self.temp_normalized_filename, "normalized.wav"),
+                (self.temp_speech_filename, "speech_only.wav"),
+            ]:
+                if not os.path.exists(source_path):
+                    continue
+                shutil.copy2(source_path, os.path.join(capture_dir, output_name))
+                saved_files += 1
+
+            if saved_files == 0:
+                os.rmdir(capture_dir)
+                self.log_event("debug_audio_capture_empty")
+                return
+
+            self.log_event("debug_audio_capture_saved", dir=capture_dir, files=saved_files)
+        except Exception as e:
+            self.log_event("debug_audio_capture_failed", error=e)
 
     def toggle_mute(self):
         """Toggles mute state and updates UI."""
@@ -700,8 +937,6 @@ class WhisperWidget(ctk.CTk):
         self.audio_frames = []
         self.update_ui_state("recording")
         self.log_event("recording_started")
-        
-        self.play_sound(800, 100) # High Beep
 
         # Open Stream
         try:
@@ -714,6 +949,7 @@ class WhisperWidget(ctk.CTk):
             )
             self.log_event("microphone_stream_opened", sample_rate=SAMPLE_RATE, chunk_size=CHUNK_SIZE)
             threading.Thread(target=self.record_loop, daemon=True).start()
+            self.play_sound(800, 100) # High Beep
         except Exception as e:
             print(f"Microphone error: {e}")
             self.log_event("microphone_error", error=e)
@@ -735,13 +971,13 @@ class WhisperWidget(ctk.CTk):
     def stop_recording(self):
         self.is_recording = False
         self.log_event("recording_stopped", frames=len(self.audio_frames))
-        
-        self.play_sound(400, 100) # Low Beep
-        
+
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
             self.stream = None
+
+        self.play_sound(400, 100) # Low Beep
 
         self.update_ui_state("processing")
         self.is_processing = True
@@ -769,15 +1005,16 @@ class WhisperWidget(ctk.CTk):
 
         # -------- VAD FIRST (CPU) --------
         speech_secs = 0.0
+        processed_source = None
         self.log_event("vad_start", file=self.temp_filename)
         try:
             speech_secs = vad_extract_speech_only(
                 in_wav_path=self.temp_filename,
                 out_wav_path=self.temp_speech_filename,
                 sample_rate=SAMPLE_RATE,
-                pad_ms=250,
-                min_speech_ms=150,
-                merge_gap_ms=400,
+                pad_ms=VAD_PAD_MS,
+                min_speech_ms=VAD_MIN_SPEECH_MS,
+                merge_gap_ms=VAD_MERGE_GAP_MS,
                 speech_prob_threshold=0.5,
             )
             self.log_event("vad_complete", speech_secs=f"{speech_secs:.3f}")
@@ -787,63 +1024,134 @@ class WhisperWidget(ctk.CTk):
             speech_secs = -1.0
 
         success = False
-        
+
         if speech_secs == 0.0:
-            print("No speech detected (VAD).")
+            print("No speech detected by VAD, trying fallback transcription.")
             self.log_event("vad_no_speech_detected")
-            success = True
-        else:
-            wav_for_whisper = (
-                self.temp_speech_filename if speech_secs > 0 else self.temp_filename
-            )
+        elif speech_secs > 0.0:
+            processed_source = self.temp_speech_filename
 
-            for attempt in range(1, 4): # 3 Attempts
+            if NOISE_REDUCTION_ENABLED:
+                if nr is None:
+                    self.log_event("noise_reduction_unavailable")
+                else:
+                    self.log_event("noise_reduction_start", source=processed_source)
+                    try:
+                        reduce_noise_wav(
+                            processed_source,
+                            self.temp_denoised_filename,
+                            prop_decrease=NOISE_REDUCTION_PROP_DECREASE,
+                            chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
+                            padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
+                            n_fft=NOISE_REDUCTION_N_FFT,
+                        )
+                        processed_source = self.temp_denoised_filename
+                        self.log_event(
+                            "noise_reduction_complete",
+                            file=processed_source,
+                            chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
+                            padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
+                            n_fft=NOISE_REDUCTION_N_FFT,
+                        )
+                    except Exception as e:
+                        print(f"Noise reduction failed, falling back to speech-only audio: {e}")
+                        self.log_event("noise_reduction_failed_fallback_speech_only", error=e)
+
+            if NORMALIZE_AUDIO_ENABLED and processed_source and os.path.exists(processed_source):
+                self.log_event("normalize_start", source=processed_source)
                 try:
-                    self.log_event("transcribe_attempt_start", attempt=attempt, source=wav_for_whisper)
-                    # print(f"Transcription Attempt {attempt}...")
-                    result = self.model.transcribe(
-                        wav_for_whisper,
-                        condition_on_previous_text=False,
-                        no_speech_threshold=0.6,
-                        logprob_threshold=-1.0
+                    stats = normalize_wav(
+                        processed_source,
+                        self.temp_normalized_filename,
+                        target_peak_dbfs=NORMALIZE_TARGET_PEAK_DBFS,
+                        max_gain_db=NORMALIZE_MAX_GAIN_DB,
                     )
-                    text = result["text"].strip()
-                    
-                    if text:
-                        print("\n[transcription]")
-                        print(text)
-                        print("[/transcription]", flush=True)
-                        pyperclip.copy(text)
-                        print("Copied transcription to clipboard.")
-                        self.log_event("transcribe_attempt_success", attempt=attempt, chars=len(text))
-                        
-                        # Log to file
-                        self.log_transcription(text)
-
-                        # Success Notification
-                        self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
-                        self.play_sound(1000, 100)
-                        self.play_sound(1500, 100)
-                        time.sleep(1) 
-                        success = True
-                        break # Success!
-                    else:
-                        print("No text detected.")
-                        self.log_event("transcribe_attempt_no_text", attempt=attempt)
-                        success = True # Treated as success (empty audio), just didn't copy
-                        break 
-
+                    processed_source = self.temp_normalized_filename
+                    self.log_event(
+                        "normalize_complete",
+                        file=processed_source,
+                        gain_db=f"{stats['gain_db']:.2f}",
+                        input_peak_dbfs=f"{stats['input_peak_dbfs']:.2f}",
+                        output_peak_dbfs=f"{stats['output_peak_dbfs']:.2f}",
+                    )
                 except Exception as e:
-                    print(f"Attempt {attempt} failed: {e}")
-                    self.log_event("transcribe_attempt_failed", attempt=attempt, error=e)
-                    time.sleep(0.5) # Brief pause before retry
+                    print(f"Normalization failed, falling back to processed speech-only audio: {e}")
+                    self.log_event("normalize_failed_fallback_processed", error=e)
+        elif NORMALIZE_AUDIO_ENABLED:
+            self.log_event("normalize_skipped", source="no_speech_or_vad_failure")
+
+        self.save_debug_audio_files()
+
+        completed_attempts = 0
+        attempts = self.build_transcribe_attempts(speech_secs, processed_source)
+
+        for attempt_number, attempt in enumerate(attempts, start=1):
+            try:
+                self.log_event(
+                    "transcribe_attempt_start",
+                    attempt=attempt_number,
+                    stage=attempt["label"],
+                    source=attempt["path"]
+                )
+                result = self.model.transcribe(
+                    attempt["path"],
+                    **attempt["options"],
+                )
+                completed_attempts += 1
+                text = result["text"].strip()
+
+                if text:
+                    print("\n[transcription]")
+                    print(text)
+                    print("[/transcription]", flush=True)
+                    pyperclip.copy(text)
+                    print("Copied transcription to clipboard.")
+                    self.log_event(
+                        "transcribe_attempt_success",
+                        attempt=attempt_number,
+                        stage=attempt["label"],
+                        chars=len(text)
+                    )
+
+                    self.log_transcription(text)
+
+                    self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                    self.play_sound_sequence([(1000, 100), (1500, 100)])
+                    time.sleep(1)
+                    success = True
+                    break
+
+                print("No text detected.")
+                self.log_event(
+                    "transcribe_attempt_no_text",
+                    attempt=attempt_number,
+                    stage=attempt["label"]
+                )
+            except Exception as e:
+                print(f"Attempt {attempt_number} failed: {e}")
+                self.log_event(
+                    "transcribe_attempt_failed",
+                    attempt=attempt_number,
+                    stage=attempt["label"],
+                    error=e
+                )
+                time.sleep(0.5)
+
+        if not success and completed_attempts > 0:
+            success = True
+            self.log_event("transcribe_all_attempts_empty", attempts=completed_attempts)
 
         self.log_event("transcription_pipeline_finish", success=success)
         self.ui_call(self.finish_processing)
 
         # Cleanup Logic
         if success:
-            for f in [self.temp_filename, self.temp_speech_filename]:
+            for f in [
+                self.temp_filename,
+                self.temp_denoised_filename,
+                self.temp_normalized_filename,
+                self.temp_speech_filename,
+            ]:
                 if os.path.exists(f):
                     try:
                         os.remove(f)
@@ -860,6 +1168,24 @@ class WhisperWidget(ctk.CTk):
                 print(f"Transcription Failed. Audio saved to: {failed_filename}")
                 self.log_event("transcription_failed_audio_saved", file=failed_filename)
                 
+                if os.path.exists(self.temp_denoised_filename):
+                    try:
+                        failed_denoised_filename = f"failed_denoised_{timestamp}.wav"
+                        os.rename(self.temp_denoised_filename, failed_denoised_filename)
+                        self.log_event("transcription_failed_denoised_saved", file=failed_denoised_filename)
+                    except:
+                        self.log_event("transcription_failed_denoised_save_failed")
+                        pass
+
+                if os.path.exists(self.temp_normalized_filename):
+                    try:
+                        failed_normalized_filename = f"failed_normalized_{timestamp}.wav"
+                        os.rename(self.temp_normalized_filename, failed_normalized_filename)
+                        self.log_event("transcription_failed_normalized_saved", file=failed_normalized_filename)
+                    except:
+                        self.log_event("transcription_failed_normalized_save_failed")
+                        pass
+
                 if os.path.exists(self.temp_speech_filename):
                     try:
                         failed_speech_filename = f"failed_speech_only_{timestamp}.wav"

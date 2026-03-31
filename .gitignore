@@ -1,5 +1,8 @@
 # Transcriptions folder (project-specific)
 transcriptions/
+debug_audio/
+sidecache/
+.sidecache/
 
 # Python
 __pycache__/
@@ -43,6 +46,7 @@ Thumbs.db
 # Logs
 *.log
 event_log.txt
+event_log.*.txt
 
 # Environment variables
 .env
