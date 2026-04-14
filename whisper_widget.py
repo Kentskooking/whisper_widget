@@ -9,6 +9,8 @@ import threading
 import time
 import sys
 import shutil
+import subprocess
+import json
 import pyperclip
 import math
 import struct
@@ -18,7 +20,6 @@ import warnings
 from queue import Queue, Empty
 from ctypes import wintypes
 from datetime import datetime
-import torchaudio
 import soundfile as sf
 try:
     import noisereduce as nr
@@ -46,11 +47,13 @@ EVENT_LOG_BACKUP_COUNT = 2
 EVENT_LOG_HEADER = "timestamp | event | details\n"
 DEBUG_AUDIO_DIR = "debug_audio"
 SAVE_DEBUG_AUDIO = True
+RAW_AUDIO_BACKUP_DIR = "raw_audio_backups"
 WHISPER_LANGUAGE = "en"
 WHISPER_NO_SPEECH_THRESHOLD = None
 VAD_PAD_MS = 400
 VAD_MIN_SPEECH_MS = 150
 VAD_MERGE_GAP_MS = 600
+VAD_SUBPROCESS_TIMEOUT_SECONDS = 180
 NOISE_REDUCTION_ENABLED = True
 NOISE_REDUCTION_PROP_DECREASE = 0.85
 NOISE_REDUCTION_CHUNK_SECONDS = 10.0
@@ -283,25 +286,8 @@ class EventLogger:
         except Exception as e:
             self._enabled = False
             print(f"Event log write failed: {e}")
-
-# ---------------- VAD (Silero, CPU) ----------------
-
-_silero_model = None
-_silero_utils = None
-
-def load_silero_vad():
-    global _silero_model, _silero_utils
-    if _silero_model is None or _silero_utils is None:
-        _silero_model, _silero_utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True
-        )
-        _silero_model.to("cpu")
-    return _silero_model, _silero_utils
-
-
-def vad_extract_speech_only(
+def run_vad_subprocess(
+    worker_script_path: str,
     in_wav_path: str,
     out_wav_path: str,
     sample_rate: int = 16000,
@@ -309,54 +295,90 @@ def vad_extract_speech_only(
     min_speech_ms: int = 150,
     merge_gap_ms: int = 400,
     speech_prob_threshold: float = 0.5,
+    timeout_seconds: int = VAD_SUBPROCESS_TIMEOUT_SECONDS,
 ) -> float:
-    """
-    Creates a speech-only WAV using Silero VAD.
-    Returns total detected speech duration (seconds).
-    Returns 0.0 if no speech detected.
-    """
+    """Runs Silero VAD in a separate process so native crashes do not kill the widget."""
+    result_path = f"{out_wav_path}.vad_result.json"
+    abs_in_wav_path = os.path.abspath(in_wav_path)
+    abs_out_wav_path = os.path.abspath(out_wav_path)
+    abs_result_path = os.path.abspath(result_path)
 
-    model, utils = load_silero_vad()
-    (get_speech_timestamps, save_audio, read_audio, _, collect_chunks) = utils
+    for stale_path in (abs_out_wav_path, abs_result_path):
+        if os.path.exists(stale_path):
+            try:
+                os.remove(stale_path)
+            except OSError:
+                pass
 
-    wav = read_audio(in_wav_path, sampling_rate=sample_rate)
+    command = [
+        sys.executable,
+        worker_script_path,
+        "--input",
+        abs_in_wav_path,
+        "--output",
+        abs_out_wav_path,
+        "--sample-rate",
+        str(sample_rate),
+        "--pad-ms",
+        str(pad_ms),
+        "--min-speech-ms",
+        str(min_speech_ms),
+        "--merge-gap-ms",
+        str(merge_gap_ms),
+        "--threshold",
+        str(speech_prob_threshold),
+        "--result-file",
+        abs_result_path,
+    ]
 
-    speech_ts = get_speech_timestamps(
-        wav,
-        model,
-        sampling_rate=sample_rate,
-        threshold=speech_prob_threshold,
-        min_speech_duration_ms=min_speech_ms,
-        min_silence_duration_ms=merge_gap_ms,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+            cwd=os.path.dirname(worker_script_path),
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"VAD worker timed out after {timeout_seconds}s") from e
 
-    if not speech_ts:
-        return 0.0
+    stdout_text = (completed.stdout or "").strip()
+    stderr_text = (completed.stderr or "").strip()
 
-    pad = int(sample_rate * (pad_ms / 1000.0))
-    n = wav.numel()
+    payload = None
+    try:
+        if os.path.exists(abs_result_path):
+            with open(abs_result_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
 
-    padded = []
-    for seg in speech_ts:
-        start = max(0, seg["start"] - pad)
-        end = min(n, seg["end"] + pad)
-        padded.append({"start": start, "end": end})
+        if completed.returncode != 0:
+            details = [f"returncode={completed.returncode}"]
+            if payload and payload.get("error"):
+                details.append(f"error={payload['error']}")
+            elif stderr_text:
+                details.append(f"stderr={stderr_text[-400:]}")
+            elif stdout_text:
+                details.append(f"stdout={stdout_text[-400:]}")
+            raise RuntimeError("VAD worker failed (" + ", ".join(details) + ")")
 
-    # Merge overlapping segments
-    padded.sort(key=lambda x: x["start"])
-    merged = [padded[0]]
-    for seg in padded[1:]:
-        last = merged[-1]
-        if seg["start"] <= last["end"]:
-            last["end"] = max(last["end"], seg["end"])
-        else:
-            merged.append(seg)
+        if payload is None:
+            raise FileNotFoundError(abs_result_path)
+    except FileNotFoundError as e:
+        raise RuntimeError("VAD worker exited without writing a result file") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError("VAD worker wrote an invalid result file") from e
+    finally:
+        if os.path.exists(abs_result_path):
+            try:
+                os.remove(abs_result_path)
+            except OSError:
+                pass
 
-    speech_audio = collect_chunks(merged, wav)
-    save_audio(out_wav_path, speech_audio, sampling_rate=sample_rate)
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error") or "VAD worker reported an unknown error")
 
-    total_samples = sum(seg["end"] - seg["start"] for seg in merged)
-    return total_samples / sample_rate
+    return float(payload["speech_secs"])
 
 
 def reduce_noise_wav(
@@ -432,8 +454,10 @@ class WhisperWidget(ctk.CTk):
         os.makedirs(LOG_DIR, exist_ok=True)
         self.event_log_path = os.path.join(self.base_dir, EVENT_LOG_FILE)
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
+        self.raw_audio_backup_dir = os.path.join(self.base_dir, RAW_AUDIO_BACKUP_DIR)
         if SAVE_DEBUG_AUDIO:
             os.makedirs(self.debug_audio_dir, exist_ok=True)
+        os.makedirs(self.raw_audio_backup_dir, exist_ok=True)
         self.event_logger = EventLogger(self.event_log_path)
         self.log_event(
             "app_start",
@@ -482,6 +506,8 @@ class WhisperWidget(ctk.CTk):
         self.temp_denoised_filename = "temp_denoised.wav"
         self.temp_normalized_filename = "temp_normalized.wav"
         self.temp_speech_filename = "temp_speech_only.wav"
+        self.current_raw_backup_path = None
+        self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
         self.log_event("audio_init_ok")
         
         # UI Elements
@@ -886,6 +912,48 @@ class WhisperWidget(ctk.CTk):
         except Exception as e:
             self.log_event("debug_audio_capture_failed", error=e)
 
+    def save_raw_audio_backup(self):
+        capture_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        backup_path = os.path.join(self.raw_audio_backup_dir, f"recording_{capture_id}.wav")
+        self.current_raw_backup_path = None
+
+        try:
+            shutil.copy2(self.temp_filename, backup_path)
+            self.current_raw_backup_path = backup_path
+            self.log_event("raw_audio_backup_saved", file=backup_path)
+        except Exception as e:
+            self.log_event("raw_audio_backup_failed", error=e)
+
+    def remove_raw_audio_backup(self):
+        backup_path = self.current_raw_backup_path
+        self.current_raw_backup_path = None
+        if not backup_path or not os.path.exists(backup_path):
+            return
+
+        try:
+            os.remove(backup_path)
+            self.log_event("raw_audio_backup_removed", file=backup_path)
+        except Exception as e:
+            self.log_event("raw_audio_backup_remove_failed", file=backup_path, error=e)
+
+    def preserve_raw_audio_backup(self) -> bool:
+        backup_path = self.current_raw_backup_path
+        self.current_raw_backup_path = None
+        if not backup_path or not os.path.exists(backup_path):
+            return False
+
+        print(f"Transcription Failed. Audio saved to: {backup_path}")
+        self.log_event("transcription_failed_audio_preserved", file=backup_path)
+
+        if os.path.exists(self.temp_filename):
+            try:
+                os.remove(self.temp_filename)
+                self.log_event("temp_file_removed", file=self.temp_filename)
+            except Exception:
+                self.log_event("temp_file_remove_failed", file=self.temp_filename)
+
+        return True
+
     def toggle_mute(self):
         """Toggles mute state and updates UI."""
         self.is_muted = not self.is_muted
@@ -997,6 +1065,7 @@ class WhisperWidget(ctk.CTk):
             wf.writeframes(b''.join(self.audio_frames))
             wf.close()
             self.log_event("audio_saved", file=self.temp_filename, frames=len(self.audio_frames))
+            self.save_raw_audio_backup()
         except Exception as e:
             print(f"Error saving WAV: {e}")
             self.log_event("audio_save_failed", error=e)
@@ -1008,7 +1077,8 @@ class WhisperWidget(ctk.CTk):
         processed_source = None
         self.log_event("vad_start", file=self.temp_filename)
         try:
-            speech_secs = vad_extract_speech_only(
+            speech_secs = run_vad_subprocess(
+                worker_script_path=self.vad_worker_path,
                 in_wav_path=self.temp_filename,
                 out_wav_path=self.temp_speech_filename,
                 sample_rate=SAMPLE_RATE,
@@ -1146,6 +1216,7 @@ class WhisperWidget(ctk.CTk):
 
         # Cleanup Logic
         if success:
+            self.remove_raw_audio_backup()
             for f in [
                 self.temp_filename,
                 self.temp_denoised_filename,
@@ -1160,43 +1231,47 @@ class WhisperWidget(ctk.CTk):
                         self.log_event("temp_file_remove_failed", file=f)
                         pass
         else:
+            # Failure: Keep the pre-VAD backup if it was captured.
+            raw_backup_preserved = self.preserve_raw_audio_backup()
+
             # Failure: Save the file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             failed_filename = f"failed_recording_{timestamp}.wav"
-            try:
-                os.rename(self.temp_filename, failed_filename)
-                print(f"Transcription Failed. Audio saved to: {failed_filename}")
-                self.log_event("transcription_failed_audio_saved", file=failed_filename)
-                
-                if os.path.exists(self.temp_denoised_filename):
-                    try:
-                        failed_denoised_filename = f"failed_denoised_{timestamp}.wav"
-                        os.rename(self.temp_denoised_filename, failed_denoised_filename)
-                        self.log_event("transcription_failed_denoised_saved", file=failed_denoised_filename)
-                    except:
-                        self.log_event("transcription_failed_denoised_save_failed")
-                        pass
+            if not raw_backup_preserved:
+                try:
+                    os.rename(self.temp_filename, failed_filename)
+                    print(f"Transcription Failed. Audio saved to: {failed_filename}")
+                    self.log_event("transcription_failed_audio_saved", file=failed_filename)
+                except Exception as e:
+                    print(f"Could not save backup file: {e}")
+                    self.log_event("transcription_failed_backup_save_error", error=e)
 
-                if os.path.exists(self.temp_normalized_filename):
-                    try:
-                        failed_normalized_filename = f"failed_normalized_{timestamp}.wav"
-                        os.rename(self.temp_normalized_filename, failed_normalized_filename)
-                        self.log_event("transcription_failed_normalized_saved", file=failed_normalized_filename)
-                    except:
-                        self.log_event("transcription_failed_normalized_save_failed")
-                        pass
+            if os.path.exists(self.temp_denoised_filename):
+                try:
+                    failed_denoised_filename = f"failed_denoised_{timestamp}.wav"
+                    os.rename(self.temp_denoised_filename, failed_denoised_filename)
+                    self.log_event("transcription_failed_denoised_saved", file=failed_denoised_filename)
+                except:
+                    self.log_event("transcription_failed_denoised_save_failed")
+                    pass
 
-                if os.path.exists(self.temp_speech_filename):
-                    try:
-                        failed_speech_filename = f"failed_speech_only_{timestamp}.wav"
-                        os.rename(self.temp_speech_filename, failed_speech_filename)
-                        self.log_event("transcription_failed_speech_saved", file=failed_speech_filename)
-                    except:
-                        self.log_event("transcription_failed_speech_save_failed")
-                        pass
-            except Exception as e:
-                print(f"Could not save backup file: {e}")
-                self.log_event("transcription_failed_backup_save_error", error=e)
+            if os.path.exists(self.temp_normalized_filename):
+                try:
+                    failed_normalized_filename = f"failed_normalized_{timestamp}.wav"
+                    os.rename(self.temp_normalized_filename, failed_normalized_filename)
+                    self.log_event("transcription_failed_normalized_saved", file=failed_normalized_filename)
+                except:
+                    self.log_event("transcription_failed_normalized_save_failed")
+                    pass
+
+            if os.path.exists(self.temp_speech_filename):
+                try:
+                    failed_speech_filename = f"failed_speech_only_{timestamp}.wav"
+                    os.rename(self.temp_speech_filename, failed_speech_filename)
+                    self.log_event("transcription_failed_speech_saved", file=failed_speech_filename)
+                except:
+                    self.log_event("transcription_failed_speech_save_failed")
+                    pass
 
     def finish_processing(self):
         self.is_processing = False
