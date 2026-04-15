@@ -53,7 +53,8 @@ WHISPER_NO_SPEECH_THRESHOLD = None
 VAD_PAD_MS = 400
 VAD_MIN_SPEECH_MS = 150
 VAD_MERGE_GAP_MS = 600
-VAD_SUBPROCESS_TIMEOUT_SECONDS = 180
+VAD_REQUEST_TIMEOUT_SECONDS = 180
+VAD_WORKER_READY_TIMEOUT_SECONDS = 30
 NOISE_REDUCTION_ENABLED = True
 NOISE_REDUCTION_PROP_DECREASE = 0.85
 NOISE_REDUCTION_CHUNK_SECONDS = 10.0
@@ -286,99 +287,247 @@ class EventLogger:
         except Exception as e:
             self._enabled = False
             print(f"Event log write failed: {e}")
-def run_vad_subprocess(
-    worker_script_path: str,
-    in_wav_path: str,
-    out_wav_path: str,
-    sample_rate: int = 16000,
-    pad_ms: int = 250,
-    min_speech_ms: int = 150,
-    merge_gap_ms: int = 400,
-    speech_prob_threshold: float = 0.5,
-    timeout_seconds: int = VAD_SUBPROCESS_TIMEOUT_SECONDS,
-) -> float:
-    """Runs Silero VAD in a separate process so native crashes do not kill the widget."""
-    result_path = f"{out_wav_path}.vad_result.json"
-    abs_in_wav_path = os.path.abspath(in_wav_path)
-    abs_out_wav_path = os.path.abspath(out_wav_path)
-    abs_result_path = os.path.abspath(result_path)
+class PersistentVADWorkerClient:
+    """Keeps Silero VAD in a separate long-lived process to avoid repeated cold starts."""
 
-    for stale_path in (abs_out_wav_path, abs_result_path):
-        if os.path.exists(stale_path):
-            try:
-                os.remove(stale_path)
-            except OSError:
-                pass
+    def __init__(self, worker_script_path: str, workdir: str, log_fn):
+        self.worker_script_path = worker_script_path
+        self.workdir = workdir
+        self.log_fn = log_fn
+        self._lock = threading.Lock()
+        self._process = None
+        self._stdout_thread = None
+        self._stderr_thread = None
+        self._response_queue = Queue()
+        self._ready_event = threading.Event()
+        self._ready = False
+        self._last_start_error = None
+        self._request_id = 0
 
-    command = [
-        sys.executable,
-        worker_script_path,
-        "--input",
-        abs_in_wav_path,
-        "--output",
-        abs_out_wav_path,
-        "--sample-rate",
-        str(sample_rate),
-        "--pad-ms",
-        str(pad_ms),
-        "--min-speech-ms",
-        str(min_speech_ms),
-        "--merge-gap-ms",
-        str(merge_gap_ms),
-        "--threshold",
-        str(speech_prob_threshold),
-        "--result-file",
-        abs_result_path,
-    ]
+    def _log(self, event, **fields):
+        try:
+            self.log_fn(event, **fields)
+        except Exception:
+            pass
 
-    try:
-        completed = subprocess.run(
+    def _is_current_process(self, process):
+        return process is not None and process is self._process
+
+    def _reset_state_locked(self):
+        self._process = None
+        self._stdout_thread = None
+        self._stderr_thread = None
+        self._response_queue = Queue()
+        self._ready_event = threading.Event()
+        self._ready = False
+        self._last_start_error = None
+
+    def _start_locked(self):
+        command = [
+            sys.executable,
+            "-u",
+            self.worker_script_path,
+            "--server",
+        ]
+        self._reset_state_locked()
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            cwd=self.workdir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
-            cwd=os.path.dirname(worker_script_path),
+            bufsize=1,
         )
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"VAD worker timed out after {timeout_seconds}s") from e
+        self._process = process
+        self._stdout_thread = threading.Thread(target=self._stdout_loop, args=(process,), daemon=True)
+        self._stderr_thread = threading.Thread(target=self._stderr_loop, args=(process,), daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+        self._log("vad_worker_started", pid=process.pid)
 
-    stdout_text = (completed.stdout or "").strip()
-    stderr_text = (completed.stderr or "").strip()
+    def _stdout_loop(self, process):
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
 
-    payload = None
-    try:
-        if os.path.exists(abs_result_path):
-            with open(abs_result_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
+                try:
+                    message = json.loads(line)
+                except Exception as e:
+                    self._log("vad_worker_stdout_invalid", pid=process.pid, error=e, line=line[-400:])
+                    continue
 
-        if completed.returncode != 0:
-            details = [f"returncode={completed.returncode}"]
-            if payload and payload.get("error"):
-                details.append(f"error={payload['error']}")
-            elif stderr_text:
-                details.append(f"stderr={stderr_text[-400:]}")
-            elif stdout_text:
-                details.append(f"stdout={stdout_text[-400:]}")
-            raise RuntimeError("VAD worker failed (" + ", ".join(details) + ")")
+                message_type = message.get("type")
+                if message_type == "ready":
+                    with self._lock:
+                        is_current = self._is_current_process(process)
+                        if is_current:
+                            self._ready = bool(message.get("ok"))
+                            self._last_start_error = None if self._ready else (message.get("error") or "unknown worker startup error")
+                            self._ready_event.set()
+                    if not is_current:
+                        continue
+                    if self._ready:
+                        self._log("vad_worker_ready", pid=process.pid)
+                    else:
+                        self._log("vad_worker_ready_failed", pid=process.pid, error=self._last_start_error)
+                elif message_type == "response":
+                    self._response_queue.put(message)
+                elif message_type == "shutdown_ack":
+                    self._log("vad_worker_shutdown_ack", pid=process.pid)
+                else:
+                    self._log("vad_worker_message_unknown", pid=process.pid, message_type=message_type)
+        finally:
+            returncode = process.poll()
+            with self._lock:
+                is_current = self._is_current_process(process)
+                if is_current:
+                    self._ready = False
+                    if not self._ready_event.is_set():
+                        self._last_start_error = f"worker exited before ready (code {returncode})"
+                        self._ready_event.set()
+            if is_current:
+                self._log("vad_worker_exited", pid=process.pid, returncode=returncode)
 
-        if payload is None:
-            raise FileNotFoundError(abs_result_path)
-    except FileNotFoundError as e:
-        raise RuntimeError("VAD worker exited without writing a result file") from e
-    except json.JSONDecodeError as e:
-        raise RuntimeError("VAD worker wrote an invalid result file") from e
-    finally:
-        if os.path.exists(abs_result_path):
+    def _stderr_loop(self, process):
+        try:
+            for raw_line in process.stderr:
+                line = raw_line.strip()
+                if line:
+                    self._log("vad_worker_stderr", pid=process.pid, line=line[-400:])
+        except Exception as e:
+            self._log("vad_worker_stderr_failed", pid=getattr(process, "pid", None), error=e)
+
+    def ensure_ready(self, timeout_seconds: int = VAD_WORKER_READY_TIMEOUT_SECONDS):
+        with self._lock:
+            process = self._process
+            if process is None or process.poll() is not None:
+                self._start_locked()
+            ready_event = self._ready_event
+
+        ready = ready_event.wait(timeout_seconds)
+        with self._lock:
+            process = self._process
+            if not ready:
+                self._terminate_locked(process, reason="startup_timeout")
+                raise RuntimeError(f"VAD worker did not become ready within {timeout_seconds}s")
+            if process is None or process.poll() is not None:
+                error = self._last_start_error or "VAD worker exited during startup"
+                raise RuntimeError(error)
+            if not self._ready:
+                raise RuntimeError(self._last_start_error or "VAD worker failed to start")
+
+    def run(
+        self,
+        in_wav_path: str,
+        out_wav_path: str,
+        sample_rate: int = 16000,
+        pad_ms: int = 250,
+        min_speech_ms: int = 150,
+        merge_gap_ms: int = 400,
+        speech_prob_threshold: float = 0.5,
+        timeout_seconds: int = VAD_REQUEST_TIMEOUT_SECONDS,
+    ) -> float:
+        self.ensure_ready()
+
+        with self._lock:
+            process = self._process
+            if process is None or process.poll() is not None or not self._ready:
+                raise RuntimeError("VAD worker is not available")
+
+            self._request_id += 1
+            request_id = self._request_id
+            response_queue = self._response_queue
+            request = {
+                "type": "run",
+                "request_id": request_id,
+                "input": os.path.abspath(in_wav_path),
+                "output": os.path.abspath(out_wav_path),
+                "sample_rate": sample_rate,
+                "pad_ms": pad_ms,
+                "min_speech_ms": min_speech_ms,
+                "merge_gap_ms": merge_gap_ms,
+                "threshold": speech_prob_threshold,
+            }
             try:
-                os.remove(abs_result_path)
-            except OSError:
+                process.stdin.write(json.dumps(request) + "\n")
+                process.stdin.flush()
+            except Exception as e:
+                self._terminate_locked(process, reason="request_send_failed")
+                raise RuntimeError("VAD worker pipe failed while sending request") from e
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with self._lock:
+                    if self._is_current_process(process):
+                        self._terminate_locked(process, reason="request_timeout")
+                raise RuntimeError(f"VAD worker timed out after {timeout_seconds}s")
+
+            try:
+                message = response_queue.get(timeout=remaining)
+            except Empty:
+                with self._lock:
+                    process_alive = self._is_current_process(process) and process.poll() is None
+                if not process_alive:
+                    raise RuntimeError("VAD worker exited while processing audio")
+                continue
+
+            if message.get("request_id") != request_id:
+                self._log(
+                    "vad_worker_response_unexpected",
+                    expected_request_id=request_id,
+                    actual_request_id=message.get("request_id"),
+                )
+                continue
+
+            if not message.get("ok"):
+                error_text = message.get("error") or "VAD worker reported an unknown error"
+                raise RuntimeError(error_text)
+
+            return float(message["speech_secs"])
+
+    def _terminate_locked(self, process, reason: str):
+        if process is None:
+            return
+        if self._is_current_process(process):
+            self._reset_state_locked()
+
+        try:
+            if process.poll() is None and process.stdin:
+                process.stdin.write(json.dumps({"type": "shutdown"}) + "\n")
+                process.stdin.flush()
+        except Exception:
+            pass
+
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2.0)
+            except Exception:
                 pass
 
-    if not payload.get("ok"):
-        raise RuntimeError(payload.get("error") or "VAD worker reported an unknown error")
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2.0)
+            except Exception:
+                pass
 
-    return float(payload["speech_secs"])
+        if process.poll() is None:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+        self._log("vad_worker_terminated", pid=getattr(process, "pid", None), reason=reason, returncode=process.poll())
+
+    def close(self):
+        with self._lock:
+            process = self._process
+            self._terminate_locked(process, reason="close")
 
 
 def reduce_noise_wav(
@@ -508,6 +657,11 @@ class WhisperWidget(ctk.CTk):
         self.temp_speech_filename = "temp_speech_only.wav"
         self.current_raw_backup_path = None
         self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
+        self.vad_client = PersistentVADWorkerClient(
+            worker_script_path=self.vad_worker_path,
+            workdir=self.base_dir,
+            log_fn=self.log_event,
+        )
         self.log_event("audio_init_ok")
         
         # UI Elements
@@ -592,6 +746,13 @@ class WhisperWidget(ctk.CTk):
             print(f"Loading model on {device}...")
             self.log_event("model_load_start", device=device, model=MODEL_SIZE)
             self.model = whisper.load_model(MODEL_SIZE, device=device)
+            try:
+                self.log_event("vad_worker_prewarm_start")
+                self.vad_client.ensure_ready()
+                self.log_event("vad_worker_prewarm_success")
+            except Exception as vad_error:
+                print(f"VAD worker prewarm failed: {vad_error}")
+                self.log_event("vad_worker_prewarm_failed", error=vad_error)
             self.ui_call(self.update_ui_state, "ready")
             print("Model loaded.")
             self.log_event("model_load_success", device=device)
@@ -1077,8 +1238,7 @@ class WhisperWidget(ctk.CTk):
         processed_source = None
         self.log_event("vad_start", file=self.temp_filename)
         try:
-            speech_secs = run_vad_subprocess(
-                worker_script_path=self.vad_worker_path,
+            speech_secs = self.vad_client.run(
                 in_wav_path=self.temp_filename,
                 out_wav_path=self.temp_speech_filename,
                 sample_rate=SAMPLE_RATE,
@@ -1282,6 +1442,7 @@ class WhisperWidget(ctk.CTk):
         self.log_event("app_close_start")
         self.shutdown_event.set()
         self.unregister_hotkey()
+        self.vad_client.close()
         try:
             if self.stream:
                 self.stream.stop_stream()
