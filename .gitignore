@@ -1,6 +1,7 @@
 # Transcriptions folder (project-specific)
 transcriptions/
 debug_audio/
+raw_audio_backups/
 sidecache/
 .sidecache/
 
@@ -47,6 +48,12 @@ Thumbs.db
 *.log
 event_log.txt
 event_log.*.txt
+
+# Local temp artifacts
+temp_*.wav
+
+# Local one-off utilities
+oneoff_transcribe.py
 
 # Environment variables
 .env
