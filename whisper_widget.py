@@ -55,6 +55,7 @@ VAD_MIN_SPEECH_MS = 150
 VAD_MERGE_GAP_MS = 600
 VAD_REQUEST_TIMEOUT_SECONDS = 180
 VAD_WORKER_READY_TIMEOUT_SECONDS = 30
+NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS = 180
 NOISE_REDUCTION_ENABLED = True
 NOISE_REDUCTION_PROP_DECREASE = 0.85
 NOISE_REDUCTION_CHUNK_SECONDS = 10.0
@@ -561,6 +562,61 @@ def reduce_noise_wav(
     sf.write(out_wav_path, reduced_audio, sample_rate, subtype="PCM_16")
 
 
+def reduce_noise_wav_subprocess(
+    worker_script_path: str,
+    in_wav_path: str,
+    out_wav_path: str,
+    prop_decrease: float = 0.85,
+    chunk_seconds: float = 10.0,
+    padding_seconds: float = 2.0,
+    n_fft: int = 512,
+    timeout_seconds: float = NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
+):
+    """Runs noise reduction in a child process so native crashes cannot kill the UI."""
+    command = [
+        sys.executable,
+        worker_script_path,
+        "--input",
+        in_wav_path,
+        "--output",
+        out_wav_path,
+        "--prop-decrease",
+        str(prop_decrease),
+        "--chunk-seconds",
+        str(chunk_seconds),
+        "--padding-seconds",
+        str(padding_seconds),
+        "--n-fft",
+        str(n_fft),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=os.path.dirname(worker_script_path) or None,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    if completed.returncode != 0:
+        details = [f"returncode={completed.returncode}"]
+        if stderr:
+            details.append(f"stderr={stderr[:400]}")
+        if stdout:
+            details.append(f"stdout={stdout[:400]}")
+        raise RuntimeError(" ".join(details))
+
+    if not stdout:
+        return {}
+
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid_worker_output={stdout[:400]}") from exc
+
+
 def normalize_wav(
     in_wav_path: str,
     out_wav_path: str,
@@ -598,6 +654,7 @@ class WhisperWidget(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.noise_reduce_worker_script = os.path.join(self.base_dir, "noise_reduce_worker.py")
         
         # Ensure Log Directory Exists
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -1267,13 +1324,15 @@ class WhisperWidget(ctk.CTk):
                 else:
                     self.log_event("noise_reduction_start", source=processed_source)
                     try:
-                        reduce_noise_wav(
+                        worker_result = reduce_noise_wav_subprocess(
+                            self.noise_reduce_worker_script,
                             processed_source,
                             self.temp_denoised_filename,
                             prop_decrease=NOISE_REDUCTION_PROP_DECREASE,
                             chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
                             padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
                             n_fft=NOISE_REDUCTION_N_FFT,
+                            timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
                         )
                         processed_source = self.temp_denoised_filename
                         self.log_event(
@@ -1282,6 +1341,7 @@ class WhisperWidget(ctk.CTk):
                             chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
                             padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
                             n_fft=NOISE_REDUCTION_N_FFT,
+                            worker_seconds=worker_result.get("seconds"),
                         )
                     except Exception as e:
                         print(f"Noise reduction failed, falling back to speech-only audio: {e}")
