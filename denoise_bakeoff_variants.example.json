@@ -1,0 +1,47 @@
+{
+  "variants": [
+    {
+      "name": "raw_normalized",
+      "type": "passthrough"
+    },
+    {
+      "name": "nr_light",
+      "type": "noise_reduce_worker",
+      "prop_decrease": 0.55,
+      "chunk_seconds": 8.0,
+      "padding_seconds": 1.5,
+      "n_fft": 512
+    },
+    {
+      "name": "nr_widget_default",
+      "type": "noise_reduce_worker",
+      "prop_decrease": 0.85,
+      "chunk_seconds": 10.0,
+      "padding_seconds": 2.0,
+      "n_fft": 512
+    },
+    {
+      "name": "nr_heavy",
+      "type": "noise_reduce_worker",
+      "prop_decrease": 0.95,
+      "chunk_seconds": 12.0,
+      "padding_seconds": 2.5,
+      "n_fft": 1024
+    },
+    {
+      "name": "rnnoise_wsl",
+      "type": "rnnoise_wsl",
+      "input_sample_rate": 48000
+    },
+    {
+      "name": "webrtc_apm_light_wsl",
+      "type": "webrtc_apm_wsl",
+      "preset": "light"
+    },
+    {
+      "name": "webrtc_apm_heavy_wsl",
+      "type": "webrtc_apm_wsl",
+      "preset": "heavy"
+    }
+  ]
+}
