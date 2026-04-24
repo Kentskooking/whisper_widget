@@ -2,6 +2,7 @@
 transcriptions/
 debug_audio/
 raw_audio_backups/
+bakeoff_outputs/
 sidecache/
 .sidecache/
 
@@ -54,6 +55,7 @@ temp_*.wav
 
 # Local one-off utilities
 oneoff_transcribe.py
+denoise_bakeoff_variants.local.json
 
 # Environment variables
 .env

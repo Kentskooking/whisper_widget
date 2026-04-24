@@ -57,6 +57,9 @@ VAD_REQUEST_TIMEOUT_SECONDS = 180
 VAD_WORKER_READY_TIMEOUT_SECONDS = 30
 NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS = 180
 NOISE_REDUCTION_ENABLED = True
+NOISE_REDUCTION_BACKEND = "webrtc_apm_wsl"
+NOISE_REDUCTION_WEBRTC_PRESET = "light"
+NOISE_REDUCTION_WEBRTC_DISTRO = "Ubuntu-22.04"
 NOISE_REDUCTION_PROP_DECREASE = 0.85
 NOISE_REDUCTION_CHUNK_SECONDS = 10.0
 NOISE_REDUCTION_PADDING_SECONDS = 2.0
@@ -589,9 +592,21 @@ def reduce_noise_wav_subprocess(
         "--n-fft",
         str(n_fft),
     ]
+    return run_json_subprocess(
+        command=command,
+        cwd=os.path.dirname(worker_script_path) or None,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def run_json_subprocess(
+    command,
+    cwd: str | None = None,
+    timeout_seconds: float = NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
+):
     completed = subprocess.run(
         command,
-        cwd=os.path.dirname(worker_script_path) or None,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=timeout_seconds,
@@ -615,6 +630,35 @@ def reduce_noise_wav_subprocess(
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"invalid_worker_output={stdout[:400]}") from exc
+
+
+def reduce_noise_wav_webrtc_apm_subprocess(
+    wrapper_script_path: str,
+    in_wav_path: str,
+    out_wav_path: str,
+    preset: str = NOISE_REDUCTION_WEBRTC_PRESET,
+    distro: str = NOISE_REDUCTION_WEBRTC_DISTRO,
+    timeout_seconds: float = NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
+):
+    """Runs WebRTC APM denoise via the local wrapper so the UI process stays isolated."""
+    command = [
+        sys.executable,
+        wrapper_script_path,
+        "--input",
+        in_wav_path,
+        "--output",
+        out_wav_path,
+        "--preset",
+        preset,
+    ]
+    if distro:
+        command.extend(["--distro", distro])
+
+    return run_json_subprocess(
+        command=command,
+        cwd=os.path.dirname(wrapper_script_path) or None,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def normalize_wav(
@@ -655,6 +699,7 @@ class WhisperWidget(ctk.CTk):
         super().__init__()
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.noise_reduce_worker_script = os.path.join(self.base_dir, "noise_reduce_worker.py")
+        self.webrtc_apm_wrapper_script = os.path.join(self.base_dir, "webrtc_apm_wav_wrapper.py")
         
         # Ensure Log Directory Exists
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -1319,11 +1364,35 @@ class WhisperWidget(ctk.CTk):
             processed_source = self.temp_speech_filename
 
             if NOISE_REDUCTION_ENABLED:
-                if nr is None:
-                    self.log_event("noise_reduction_unavailable")
-                else:
-                    self.log_event("noise_reduction_start", source=processed_source)
-                    try:
+                noise_backend = NOISE_REDUCTION_BACKEND
+                self.log_event("noise_reduction_start", source=processed_source, backend=noise_backend)
+                try:
+                    if noise_backend == "webrtc_apm_wsl":
+                        if not os.path.exists(self.webrtc_apm_wrapper_script):
+                            raise FileNotFoundError(f"Missing WebRTC wrapper: {self.webrtc_apm_wrapper_script}")
+
+                        worker_result = reduce_noise_wav_webrtc_apm_subprocess(
+                            self.webrtc_apm_wrapper_script,
+                            processed_source,
+                            self.temp_denoised_filename,
+                            preset=NOISE_REDUCTION_WEBRTC_PRESET,
+                            distro=NOISE_REDUCTION_WEBRTC_DISTRO,
+                            timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
+                        )
+                        processed_source = self.temp_denoised_filename
+                        self.log_event(
+                            "noise_reduction_complete",
+                            file=processed_source,
+                            backend=noise_backend,
+                            preset=NOISE_REDUCTION_WEBRTC_PRESET,
+                            output_sample_rate_hz=worker_result.get("output_sample_rate_hz"),
+                            output_audio_seconds=worker_result.get("seconds"),
+                            processing_seconds=worker_result.get("elapsed_seconds"),
+                        )
+                    elif noise_backend == "noisereduce_subprocess":
+                        if nr is None:
+                            raise RuntimeError("noisereduce is not installed")
+
                         worker_result = reduce_noise_wav_subprocess(
                             self.noise_reduce_worker_script,
                             processed_source,
@@ -1338,14 +1407,21 @@ class WhisperWidget(ctk.CTk):
                         self.log_event(
                             "noise_reduction_complete",
                             file=processed_source,
+                            backend=noise_backend,
                             chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
                             padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
                             n_fft=NOISE_REDUCTION_N_FFT,
-                            worker_seconds=worker_result.get("seconds"),
+                            output_audio_seconds=worker_result.get("seconds"),
                         )
-                    except Exception as e:
-                        print(f"Noise reduction failed, falling back to speech-only audio: {e}")
-                        self.log_event("noise_reduction_failed_fallback_speech_only", error=e)
+                    else:
+                        raise RuntimeError(f"unsupported_noise_reduction_backend={noise_backend}")
+                except Exception as e:
+                    print(f"Noise reduction failed, falling back to speech-only audio: {e}")
+                    self.log_event(
+                        "noise_reduction_failed_fallback_speech_only",
+                        backend=noise_backend,
+                        error=e,
+                    )
 
             if NORMALIZE_AUDIO_ENABLED and processed_source and os.path.exists(processed_source):
                 self.log_event("normalize_start", source=processed_source)
