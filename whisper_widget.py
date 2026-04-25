@@ -16,6 +16,7 @@ import math
 import struct
 import numpy as np
 import torch
+import torchaudio.functional as torchaudio_functional
 import warnings
 from queue import Queue, Empty
 from ctypes import wintypes
@@ -666,11 +667,27 @@ def normalize_wav(
     out_wav_path: str,
     target_peak_dbfs: float = -4.0,
     max_gain_db: float = 10.0,
+    target_sample_rate: int | None = SAMPLE_RATE,
 ):
-    """Writes a conservatively peak-normalized mono WAV."""
+    """Writes a conservatively peak-normalized mono WAV, optionally resampled."""
     audio, sample_rate = sf.read(in_wav_path, dtype="float32")
     if getattr(audio, "ndim", 1) > 1:
         audio = audio.mean(axis=1)
+
+    if target_sample_rate and int(sample_rate) != int(target_sample_rate):
+        audio_tensor = torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0)
+        audio = (
+            torchaudio_functional.resample(
+                audio_tensor,
+                orig_freq=int(sample_rate),
+                new_freq=int(target_sample_rate),
+            )
+            .squeeze(0)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        sample_rate = int(target_sample_rate)
 
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     if peak <= 1e-6:
@@ -679,6 +696,7 @@ def normalize_wav(
             "gain_db": 0.0,
             "input_peak_dbfs": float("-inf"),
             "output_peak_dbfs": float("-inf"),
+            "sample_rate": int(sample_rate),
         }
 
     target_peak = 10 ** (target_peak_dbfs / 20.0)
@@ -692,6 +710,7 @@ def normalize_wav(
         "gain_db": 20.0 * math.log10(max(gain, 1e-12)),
         "input_peak_dbfs": 20.0 * math.log10(max(peak, 1e-12)),
         "output_peak_dbfs": 20.0 * math.log10(max(output_peak, 1e-12)),
+        "sample_rate": int(sample_rate),
     }
 
 class WhisperWidget(ctk.CTk):
