@@ -5,6 +5,7 @@ import customtkinter as ctk
 import whisper
 import pyaudio
 import wave
+import audioop
 import threading
 import time
 import sys
@@ -16,7 +17,6 @@ import math
 import struct
 import numpy as np
 import torch
-import torchaudio.functional as torchaudio_functional
 import warnings
 from queue import Queue, Empty
 from ctypes import wintypes
@@ -67,7 +67,7 @@ NOISE_REDUCTION_PADDING_SECONDS = 2.0
 NOISE_REDUCTION_N_FFT = 512
 NORMALIZE_AUDIO_ENABLED = True
 NORMALIZE_TARGET_PEAK_DBFS = -4.0
-NORMALIZE_MAX_GAIN_DB = 14.0
+NORMALIZE_MAX_GAIN_DB = 16.0
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -665,52 +665,71 @@ def reduce_noise_wav_webrtc_apm_subprocess(
 def normalize_wav(
     in_wav_path: str,
     out_wav_path: str,
-    target_peak_dbfs: float = -4.0,
-    max_gain_db: float = 10.0,
+    target_peak_dbfs: float = NORMALIZE_TARGET_PEAK_DBFS,
+    max_gain_db: float = NORMALIZE_MAX_GAIN_DB,
     target_sample_rate: int | None = SAMPLE_RATE,
 ):
-    """Writes a conservatively peak-normalized mono WAV, optionally resampled."""
-    audio, sample_rate = sf.read(in_wav_path, dtype="float32")
-    if getattr(audio, "ndim", 1) > 1:
-        audio = audio.mean(axis=1)
+    """Writes a conservatively peak-normalized mono PCM WAV.
 
+    Keep this path independent of torch/torchaudio/CUDA. A Python exception here
+    can be handled by the caller; a native library access violation cannot.
+    """
+    with wave.open(in_wav_path, "rb") as reader:
+        channels = reader.getnchannels()
+        sample_width = reader.getsampwidth()
+        sample_rate = reader.getframerate()
+        compression = reader.getcomptype()
+        frames = reader.readframes(reader.getnframes())
+
+    if compression != "NONE":
+        raise ValueError(f"unsupported WAV compression: {compression}")
+    if sample_width != 2:
+        raise ValueError(f"normalize_wav only supports 16-bit PCM, got {sample_width * 8}-bit")
+    if channels == 2:
+        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
+        channels = 1
+    elif channels != 1:
+        raise ValueError(f"normalize_wav only supports mono/stereo WAV, got {channels} channels")
+
+    input_sample_rate = int(sample_rate)
     if target_sample_rate and int(sample_rate) != int(target_sample_rate):
-        audio_tensor = torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0)
-        audio = (
-            torchaudio_functional.resample(
-                audio_tensor,
-                orig_freq=int(sample_rate),
-                new_freq=int(target_sample_rate),
-            )
-            .squeeze(0)
-            .cpu()
-            .numpy()
-            .astype(np.float32, copy=False)
+        frames, _ = audioop.ratecv(
+            frames,
+            sample_width,
+            channels,
+            int(sample_rate),
+            int(target_sample_rate),
+            None,
         )
         sample_rate = int(target_sample_rate)
 
-    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-    if peak <= 1e-6:
-        sf.write(out_wav_path, audio, sample_rate, subtype="PCM_16")
-        return {
-            "gain_db": 0.0,
-            "input_peak_dbfs": float("-inf"),
-            "output_peak_dbfs": float("-inf"),
-            "sample_rate": int(sample_rate),
-        }
+    full_scale = float((1 << (8 * sample_width - 1)) - 1)
+    peak = float(audioop.max(frames, sample_width)) if frames else 0.0
+    if peak <= 0.0:
+        normalized_frames = frames
+        gain = 1.0
+        output_peak = 0.0
+    else:
+        target_peak = full_scale * (10 ** (target_peak_dbfs / 20.0))
+        max_gain = 10 ** (max_gain_db / 20.0)
+        gain = min(max_gain, max(1.0, target_peak / peak))
+        normalized_frames = audioop.mul(frames, sample_width, gain)
+        output_peak = float(audioop.max(normalized_frames, sample_width)) if normalized_frames else 0.0
 
-    target_peak = 10 ** (target_peak_dbfs / 20.0)
-    max_gain = 10 ** (max_gain_db / 20.0)
-    gain = min(max_gain, max(1.0, target_peak / peak))
-    normalized_audio = np.clip(audio * gain, -0.999, 0.999)
-    output_peak = float(np.max(np.abs(normalized_audio))) if normalized_audio.size else 0.0
-    sf.write(out_wav_path, normalized_audio, sample_rate, subtype="PCM_16")
+    with wave.open(out_wav_path, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(sample_width)
+        writer.setframerate(int(sample_rate))
+        writer.writeframes(normalized_frames)
 
+    input_peak_dbfs = 20.0 * math.log10(max(peak / full_scale, 1e-12))
+    output_peak_dbfs = 20.0 * math.log10(max(output_peak / full_scale, 1e-12))
     return {
         "gain_db": 20.0 * math.log10(max(gain, 1e-12)),
-        "input_peak_dbfs": 20.0 * math.log10(max(peak, 1e-12)),
-        "output_peak_dbfs": 20.0 * math.log10(max(output_peak, 1e-12)),
+        "input_peak_dbfs": input_peak_dbfs,
+        "output_peak_dbfs": output_peak_dbfs,
         "sample_rate": int(sample_rate),
+        "input_sample_rate": input_sample_rate,
     }
 
 class WhisperWidget(ctk.CTk):
@@ -1458,6 +1477,8 @@ class WhisperWidget(ctk.CTk):
                         gain_db=f"{stats['gain_db']:.2f}",
                         input_peak_dbfs=f"{stats['input_peak_dbfs']:.2f}",
                         output_peak_dbfs=f"{stats['output_peak_dbfs']:.2f}",
+                        input_sample_rate_hz=stats["input_sample_rate"],
+                        output_sample_rate_hz=stats["sample_rate"],
                     )
                 except Exception as e:
                     print(f"Normalization failed, falling back to processed speech-only audio: {e}")
