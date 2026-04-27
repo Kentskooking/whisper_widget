@@ -77,6 +77,7 @@ CHUNKED_TEMP_DIR = "chunked_transcription_work"
 CHUNKED_KEEP_TEMP_ON_SUCCESS = False
 CHUNKED_KEEP_TEMP_ON_FAILURE = True
 CHUNKED_SAVE_DEBUG_ARTIFACTS = True
+CHUNKED_WHISPER_MAX_ATTEMPTS = 2
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -702,6 +703,11 @@ class PersistentWhisperWorkerClient:
         with self._lock:
             return bool(self._ready and self._process is not None and self._process.poll() is None)
 
+    def restart(self, reason: str = "restart_requested"):
+        with self._lock:
+            process = self._process
+            self._terminate_locked(process, reason=reason)
+
     def transcribe(
         self,
         audio_path: str,
@@ -709,7 +715,11 @@ class PersistentWhisperWorkerClient:
         timeout_seconds: int = WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
     ) -> dict:
         with self._request_lock:
-            self.ensure_ready()
+            ready_timeout = min(
+                WHISPER_WORKER_READY_TIMEOUT_SECONDS,
+                max(5, timeout_seconds),
+            )
+            self.ensure_ready(timeout_seconds=ready_timeout)
             with self._lock:
                 process = self._process
                 if process is None or process.poll() is not None or not self._ready:
@@ -1139,6 +1149,7 @@ class WhisperWidget(ctk.CTk):
             overlap_seconds=CHUNKED_OVERLAP_SECONDS,
             queue_maxsize=CHUNKED_QUEUE_MAXSIZE,
             finalize_timeout_seconds=CHUNKED_FINALIZE_TIMEOUT_SECONDS,
+            whisper_max_attempts=CHUNKED_WHISPER_MAX_ATTEMPTS,
             save_debug_artifacts=CHUNKED_SAVE_DEBUG_ARTIFACTS,
             temp_dir=self.chunked_temp_dir,
         )
@@ -1644,44 +1655,76 @@ class WhisperWidget(ctk.CTk):
             return result
 
         result["transcribed_path"] = transcribe_path
-        try:
-            self.log_chunk_event("whisper_start", chunk_index=chunk_index, stage=stage, source=transcribe_path)
-            started = time.perf_counter()
-            request_timeout = min(
-                WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
-                max(5, CHUNKED_FINALIZE_TIMEOUT_SECONDS - 5),
-            )
-            whisper_result = self.transcribe_with_whisper(
-                transcribe_path,
-                self.base_transcribe_options(),
-                timeout_seconds=request_timeout,
-            )
-            elapsed = time.perf_counter() - started
-            text = (whisper_result.get("text") or "").strip()
-            result["text"] = text
-            result["timings"]["whisper_seconds"] = elapsed
-            result["ok"] = True
+        max_attempts = max(1, int(CHUNKED_WHISPER_MAX_ATTEMPTS))
+        request_timeout = min(
+            WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
+            max(10, CHUNKED_FINALIZE_TIMEOUT_SECONDS - 25),
+        )
+        result["timings"]["whisper_attempt_timeout_seconds"] = request_timeout
+        for whisper_attempt in range(1, max_attempts + 1):
+            try:
+                self.log_chunk_event(
+                    "whisper_start",
+                    chunk_index=chunk_index,
+                    stage=stage,
+                    source=transcribe_path,
+                    attempt=whisper_attempt,
+                    max_attempts=max_attempts,
+                )
+                started = time.perf_counter()
+                whisper_result = self.transcribe_with_whisper(
+                    transcribe_path,
+                    self.base_transcribe_options(),
+                    timeout_seconds=request_timeout,
+                )
+                elapsed = time.perf_counter() - started
+                text = (whisper_result.get("text") or "").strip()
+                result["text"] = text
+                result["timings"]["whisper_seconds"] = elapsed
+                result["timings"]["whisper_attempts"] = whisper_attempt
+                result["ok"] = True
 
-            if text:
+                if text:
+                    self.log_chunk_event(
+                        "whisper_success",
+                        chunk_index=chunk_index,
+                        stage=stage,
+                        chars=len(text),
+                        processing_seconds=f"{elapsed:.3f}",
+                        attempt=whisper_attempt,
+                    )
+                else:
+                    self.log_chunk_event(
+                        "whisper_no_text",
+                        chunk_index=chunk_index,
+                        stage=stage,
+                        processing_seconds=f"{elapsed:.3f}",
+                        attempt=whisper_attempt,
+                    )
+                return result
+            except Exception as e:
+                result["error"] = str(e)
+                result["timings"]["whisper_attempts"] = whisper_attempt
                 self.log_chunk_event(
-                    "whisper_success",
+                    "whisper_failed",
                     chunk_index=chunk_index,
                     stage=stage,
-                    chars=len(text),
-                    processing_seconds=f"{elapsed:.3f}",
+                    error=e,
+                    attempt=whisper_attempt,
+                    max_attempts=max_attempts,
                 )
-            else:
+                if whisper_attempt >= max_attempts:
+                    return result
+
                 self.log_chunk_event(
-                    "whisper_no_text",
+                    "whisper_retry_restart",
                     chunk_index=chunk_index,
                     stage=stage,
-                    processing_seconds=f"{elapsed:.3f}",
+                    next_attempt=whisper_attempt + 1,
                 )
-            return result
-        except Exception as e:
-            result["error"] = str(e)
-            self.log_chunk_event("whisper_failed", chunk_index=chunk_index, stage=stage, error=e)
-            return result
+                self.restart_whisper_worker(reason="chunk_whisper_retry")
+
+        return result
 
     def transcript_words_for_match(self, text):
         words = []
@@ -1943,14 +1986,21 @@ class WhisperWidget(ctk.CTk):
             self.log_event("model_load_failed", error=e)
 
     def is_whisper_ready(self):
-        return bool(self.whisper_ready)
+        return self.whisper_client.is_ready()
 
     def transcribe_with_whisper(self, audio_path, options, timeout_seconds=WHISPER_TRANSCRIBE_TIMEOUT_SECONDS):
-        return self.whisper_client.transcribe(
-            audio_path,
-            options or {},
-            timeout_seconds=timeout_seconds,
-        )
+        try:
+            return self.whisper_client.transcribe(
+                audio_path,
+                options or {},
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            self.whisper_ready = self.whisper_client.is_ready()
+
+    def restart_whisper_worker(self, reason="restart_requested"):
+        self.whisper_ready = False
+        self.whisper_client.restart(reason=reason)
 
     def ui_call(self, fn, *args, **kwargs):
         """Runs UI work on the Tk main thread."""
