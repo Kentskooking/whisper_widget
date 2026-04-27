@@ -1082,6 +1082,164 @@ class WhisperWidget(ctk.CTk):
         finally:
             self.chunk_spooler = None
 
+    def chunk_artifact_path(self, chunk, suffix):
+        root, _ = os.path.splitext(chunk["path"])
+        return f"{root}_{suffix}.wav"
+
+    def process_chunk_audio(self, chunk):
+        chunk_index = chunk.get("index")
+        source_path = chunk["path"]
+        started = time.perf_counter()
+        result = {
+            "ok": False,
+            "chunk_index": chunk_index,
+            "source_path": source_path,
+            "speech_secs": 0.0,
+            "processed_path": None,
+            "no_speech": False,
+            "error": None,
+            "timings": {},
+        }
+
+        self.log_chunk_event("processing_start", chunk_index=chunk_index, file=source_path)
+        try:
+            speech_path = self.chunk_artifact_path(chunk, "speech_only")
+            denoised_path = self.chunk_artifact_path(chunk, "denoised")
+            normalized_path = self.chunk_artifact_path(chunk, "normalized")
+
+            vad_started = time.perf_counter()
+            speech_secs = self.vad_client.run(
+                in_wav_path=source_path,
+                out_wav_path=speech_path,
+                sample_rate=SAMPLE_RATE,
+                pad_ms=VAD_PAD_MS,
+                min_speech_ms=VAD_MIN_SPEECH_MS,
+                merge_gap_ms=VAD_MERGE_GAP_MS,
+                speech_prob_threshold=0.5,
+            )
+            vad_seconds = time.perf_counter() - vad_started
+            result["speech_secs"] = speech_secs
+            result["timings"]["vad_seconds"] = vad_seconds
+            self.log_chunk_event(
+                "vad_complete",
+                chunk_index=chunk_index,
+                speech_secs=f"{speech_secs:.3f}",
+                processing_seconds=f"{vad_seconds:.3f}",
+            )
+
+            if speech_secs <= 0.0:
+                result["ok"] = True
+                result["no_speech"] = True
+                result["timings"]["total_seconds"] = time.perf_counter() - started
+                self.log_chunk_event(
+                    "processing_complete",
+                    chunk_index=chunk_index,
+                    no_speech=True,
+                    total_seconds=f"{result['timings']['total_seconds']:.3f}",
+                )
+                return result
+
+            processed_source = speech_path
+            if NOISE_REDUCTION_ENABLED:
+                noise_backend = NOISE_REDUCTION_BACKEND
+                denoise_started = time.perf_counter()
+                if noise_backend == "webrtc_apm_wsl":
+                    worker_result = reduce_noise_wav_webrtc_apm_subprocess(
+                        self.webrtc_apm_wrapper_script,
+                        processed_source,
+                        denoised_path,
+                        preset=NOISE_REDUCTION_WEBRTC_PRESET,
+                        distro=NOISE_REDUCTION_WEBRTC_DISTRO,
+                        timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
+                    )
+                    processed_source = denoised_path
+                    denoise_seconds = time.perf_counter() - denoise_started
+                    result["timings"]["denoise_seconds"] = denoise_seconds
+                    self.log_chunk_event(
+                        "denoise_complete",
+                        chunk_index=chunk_index,
+                        file=processed_source,
+                        backend=noise_backend,
+                        output_sample_rate_hz=worker_result.get("output_sample_rate_hz"),
+                        output_audio_seconds=worker_result.get("seconds"),
+                        processing_seconds=f"{denoise_seconds:.3f}",
+                    )
+                elif noise_backend == "noisereduce_subprocess":
+                    if nr is None:
+                        raise RuntimeError("noisereduce is not installed")
+                    worker_result = reduce_noise_wav_subprocess(
+                        self.noise_reduce_worker_script,
+                        processed_source,
+                        denoised_path,
+                        prop_decrease=NOISE_REDUCTION_PROP_DECREASE,
+                        chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
+                        padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
+                        n_fft=NOISE_REDUCTION_N_FFT,
+                        timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
+                    )
+                    processed_source = denoised_path
+                    denoise_seconds = time.perf_counter() - denoise_started
+                    result["timings"]["denoise_seconds"] = denoise_seconds
+                    self.log_chunk_event(
+                        "denoise_complete",
+                        chunk_index=chunk_index,
+                        file=processed_source,
+                        backend=noise_backend,
+                        output_audio_seconds=worker_result.get("seconds"),
+                        processing_seconds=f"{denoise_seconds:.3f}",
+                    )
+                else:
+                    raise RuntimeError(f"unsupported_noise_reduction_backend={noise_backend}")
+            else:
+                self.log_chunk_event("denoise_skipped", chunk_index=chunk_index)
+
+            if NORMALIZE_AUDIO_ENABLED and processed_source and os.path.exists(processed_source):
+                normalize_started = time.perf_counter()
+                stats = normalize_wav(
+                    processed_source,
+                    normalized_path,
+                    target_peak_dbfs=NORMALIZE_TARGET_PEAK_DBFS,
+                    max_gain_db=NORMALIZE_MAX_GAIN_DB,
+                )
+                processed_source = normalized_path
+                normalize_seconds = time.perf_counter() - normalize_started
+                result["timings"]["normalize_seconds"] = normalize_seconds
+                self.log_chunk_event(
+                    "normalize_complete",
+                    chunk_index=chunk_index,
+                    file=processed_source,
+                    gain_db=f"{stats['gain_db']:.2f}",
+                    input_peak_dbfs=f"{stats['input_peak_dbfs']:.2f}",
+                    output_peak_dbfs=f"{stats['output_peak_dbfs']:.2f}",
+                    input_sample_rate_hz=stats["input_sample_rate"],
+                    output_sample_rate_hz=stats["sample_rate"],
+                    processing_seconds=f"{normalize_seconds:.3f}",
+                )
+            else:
+                self.log_chunk_event("normalize_skipped", chunk_index=chunk_index)
+
+            result["ok"] = True
+            result["processed_path"] = processed_source
+            result["timings"]["total_seconds"] = time.perf_counter() - started
+            self.log_chunk_event(
+                "processing_complete",
+                chunk_index=chunk_index,
+                file=processed_source,
+                no_speech=False,
+                total_seconds=f"{result['timings']['total_seconds']:.3f}",
+            )
+            return result
+        except Exception as e:
+            result["error"] = str(e)
+            result["timings"]["total_seconds"] = time.perf_counter() - started
+            self.log_chunk_event(
+                "failed",
+                chunk_index=chunk_index,
+                error=e,
+                total_seconds=f"{result['timings']['total_seconds']:.3f}",
+            )
+            return result
+
     def log_transcription(self, text):
         """Appends transcription to a daily log file."""
         try:
