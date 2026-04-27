@@ -1409,6 +1409,36 @@ class WhisperWidget(ctk.CTk):
                 words.append(normalized)
         return words
 
+    def trailing_word_punctuation(self, word):
+        word = (word or "").strip()
+        while word and word[-1] in "\"')]}":
+            word = word[:-1]
+
+        punctuation = ""
+        while word and word[-1] in ".,!?;:":
+            punctuation = word[-1] + punctuation
+            word = word[:-1]
+        return punctuation
+
+    def transfer_discarded_overlap_punctuation(self, existing_text, next_original_words, overlap_words):
+        if overlap_words <= 0 or not next_original_words:
+            return existing_text
+
+        existing_words = existing_text.split()
+        if not existing_words:
+            return existing_text
+
+        retained_word = existing_words[-1]
+        discarded_word = next_original_words[overlap_words - 1]
+        if self.trailing_word_punctuation(retained_word):
+            return existing_text
+
+        punctuation = self.trailing_word_punctuation(discarded_word)
+        if not punctuation:
+            return existing_text
+
+        return f"{existing_text}{punctuation}"
+
     def merge_transcript_overlap(self, existing_text, next_text, max_overlap_words=16):
         existing_text = (existing_text or "").strip()
         next_text = (next_text or "").strip()
@@ -1431,6 +1461,11 @@ class WhisperWidget(ctk.CTk):
 
         next_original_words = next_text.split()
         remaining_next = " ".join(next_original_words[overlap_words:]).strip()
+        existing_text = self.transfer_discarded_overlap_punctuation(
+            existing_text,
+            next_original_words,
+            overlap_words,
+        )
         if not remaining_next:
             return existing_text
         if existing_text[-1:] in ".!?" and remaining_next[:1].islower():
@@ -1448,6 +1483,63 @@ class WhisperWidget(ctk.CTk):
             stitched = self.merge_transcript_overlap(stitched, text)
         return stitched.strip()
 
+    def copy_chunk_debug_artifacts(self, artifact_dir, chunk_results):
+        chunks_dir = os.path.join(artifact_dir, "chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
+        copied_by_chunk = {}
+
+        for result in sorted(chunk_results, key=lambda item: item.get("chunk_index", -1)):
+            chunk_index = result.get("chunk_index")
+            if chunk_index is None:
+                continue
+
+            source_path = result.get("source_path")
+            candidates = []
+            if source_path:
+                root, _ = os.path.splitext(source_path)
+                candidates.extend([
+                    ("raw", source_path),
+                    ("speech_only", f"{root}_speech_only.wav"),
+                    ("denoised", f"{root}_denoised.wav"),
+                    ("normalized", f"{root}_normalized.wav"),
+                ])
+
+            processing = result.get("processing") or {}
+            for label, path in (
+                ("processed", processing.get("processed_path")),
+                ("transcribed", result.get("transcribed_path")),
+            ):
+                if path:
+                    candidates.append((label, path))
+
+            copied = {}
+            seen_paths = set()
+            for label, path in candidates:
+                if not path:
+                    continue
+                normalized_path = os.path.abspath(path)
+                if normalized_path in seen_paths or not os.path.exists(normalized_path):
+                    continue
+                seen_paths.add(normalized_path)
+
+                destination = os.path.join(chunks_dir, f"chunk_{int(chunk_index):04d}_{label}.wav")
+                try:
+                    shutil.copy2(normalized_path, destination)
+                    copied[label] = destination
+                except Exception as e:
+                    copied[f"{label}_copy_error"] = str(e)
+                    self.log_chunk_event(
+                        "debug_artifact_copy_failed",
+                        chunk_index=chunk_index,
+                        label=label,
+                        source=normalized_path,
+                        error=e,
+                    )
+
+            copied_by_chunk[chunk_index] = copied
+
+        return copied_by_chunk
+
     def write_chunk_transcript_debug(self, chunk_results, stitched_text, reason):
         if not SAVE_DEBUG_AUDIO or not CHUNKED_SAVE_DEBUG_ARTIFACTS:
             return None
@@ -1455,11 +1547,18 @@ class WhisperWidget(ctk.CTk):
         try:
             debug_dir = os.path.join(self.debug_audio_dir, "chunked_transcripts")
             os.makedirs(debug_dir, exist_ok=True)
+            artifact_root = os.path.join(self.debug_audio_dir, "chunked_runs")
+            os.makedirs(artifact_root, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            output_path = os.path.join(debug_dir, f"chunked_{timestamp}_{reason}.json")
+            run_name = f"chunked_{timestamp}_{reason}"
+            artifact_dir = os.path.join(artifact_root, run_name)
+            os.makedirs(artifact_dir, exist_ok=True)
+            copied_artifacts = self.copy_chunk_debug_artifacts(artifact_dir, chunk_results)
+            output_path = os.path.join(debug_dir, f"{run_name}.json")
             payload = {
                 "reason": reason,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
+                "artifact_dir": artifact_dir,
                 "stitched_chars": len(stitched_text or ""),
                 "stitched_text": stitched_text or "",
                 "chunks": [],
@@ -1476,6 +1575,7 @@ class WhisperWidget(ctk.CTk):
                     "transcribed_path": result.get("transcribed_path"),
                     "error": result.get("error"),
                     "timings": result.get("timings") or {},
+                    "debug_artifacts": copied_artifacts.get(result.get("chunk_index"), {}),
                     "processing": {
                         "ok": processing.get("ok"),
                         "no_speech": processing.get("no_speech"),
@@ -1486,12 +1586,21 @@ class WhisperWidget(ctk.CTk):
                     },
                 })
 
+            transcript_path = os.path.join(artifact_dir, "stitched_transcript.txt")
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                f.write(stitched_text or "")
+
+            manifest_path = os.path.join(artifact_dir, "manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
 
             self.log_chunk_event(
                 "transcript_debug_saved",
                 file=output_path,
+                artifact_dir=artifact_dir,
                 chunks=len(payload["chunks"]),
                 reason=reason,
             )
