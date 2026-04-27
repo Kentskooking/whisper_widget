@@ -925,6 +925,7 @@ class WhisperWidget(ctk.CTk):
         self.chunk_transcribe_thread = None
         self.chunk_transcribe_results = {}
         self.chunk_transcribe_lock = threading.Lock()
+        self.chunk_pipeline_failed = False
         self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
         self.vad_client = PersistentVADWorkerClient(
             worker_script_path=self.vad_worker_path,
@@ -1032,6 +1033,7 @@ class WhisperWidget(ctk.CTk):
     def start_chunk_capture(self):
         self.chunk_spooler = None
         self.chunk_capture_chunks = []
+        self.chunk_pipeline_failed = False
         if not CHUNKED_TRANSCRIPTION_ENABLED:
             return
 
@@ -1048,6 +1050,7 @@ class WhisperWidget(ctk.CTk):
                 overlap_seconds=CHUNKED_OVERLAP_SECONDS,
                 log_fn=self.log_chunk_event,
             )
+            self.start_chunk_transcription_queue()
             self.log_chunk_event(
                 "capture_started",
                 chunk_seconds=CHUNKED_CHUNK_SECONDS,
@@ -1065,24 +1068,38 @@ class WhisperWidget(ctk.CTk):
             return
 
         try:
-            self.chunk_spooler.add_frame(data)
+            chunks = self.chunk_spooler.add_frame(data)
+            for chunk in chunks:
+                self.chunk_capture_chunks.append(chunk)
+                if not self.enqueue_chunk_for_transcription(chunk):
+                    self.chunk_pipeline_failed = True
         except Exception as e:
             self.log_chunk_event("capture_frame_failed", error=e)
             self.chunk_spooler = None
+            self.chunk_pipeline_failed = True
 
     def finalize_chunk_capture(self, reason="recording_stop"):
         if self.chunk_spooler is None:
-            return
+            return []
 
         try:
-            self.chunk_capture_chunks = self.chunk_spooler.finalize()
+            existing_chunks = len(self.chunk_capture_chunks)
+            all_chunks = self.chunk_spooler.finalize()
+            new_chunks = all_chunks[existing_chunks:]
+            for chunk in new_chunks:
+                self.chunk_capture_chunks.append(chunk)
+                if not self.enqueue_chunk_for_transcription(chunk):
+                    self.chunk_pipeline_failed = True
             self.log_chunk_event(
                 "capture_finalized",
                 chunks=len(self.chunk_capture_chunks),
                 reason=reason,
             )
+            return list(self.chunk_capture_chunks)
         except Exception as e:
             self.log_chunk_event("capture_finalize_failed", reason=reason, error=e)
+            self.chunk_pipeline_failed = True
+            return []
         finally:
             self.chunk_spooler = None
 
@@ -1909,7 +1926,68 @@ class WhisperWidget(ctk.CTk):
         self.log_event("transcription_pipeline_start")
 
         # Save and Transcribe in Background
-        threading.Thread(target=self.transcribe_audio, daemon=True).start()
+        if (
+            CHUNKED_TRANSCRIPTION_ENABLED
+            and self.chunk_transcribe_queue is not None
+            and self.chunk_capture_chunks
+        ):
+            threading.Thread(target=self.finalize_chunked_transcription, daemon=True).start()
+        else:
+            threading.Thread(target=self.transcribe_audio, daemon=True).start()
+
+    def finalize_chunked_transcription(self):
+        self.log_event("chunked_transcription_pipeline_start", chunks=len(self.chunk_capture_chunks))
+
+        try:
+            if self.chunk_pipeline_failed:
+                raise RuntimeError("chunk_pipeline_marked_failed")
+
+            chunk_results = self.finish_chunk_transcription_queue()
+            failed_results = [result for result in chunk_results if not result.get("ok")]
+            if failed_results:
+                raise RuntimeError(f"chunk_transcription_failures={len(failed_results)}")
+
+            text = self.stitch_chunk_transcripts(chunk_results)
+            if text:
+                print("\n[transcription]")
+                print(text)
+                print("[/transcription]", flush=True)
+                pyperclip.copy(text)
+                print("Copied transcription to clipboard.")
+                self.log_event(
+                    "chunked_transcription_success",
+                    chunks=len(chunk_results),
+                    chars=len(text),
+                )
+                self.log_transcription(text)
+                self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                self.play_sound_sequence([(1000, 100), (1500, 100)])
+                time.sleep(1)
+            else:
+                self.log_event("chunked_transcription_empty", chunks=len(chunk_results))
+
+            self.log_event(
+                "chunked_transcription_pipeline_finish",
+                success=True,
+                chunks=len(chunk_results),
+                chars=len(text),
+            )
+            self.cleanup_chunked_temp_dir(
+                keep=CHUNKED_KEEP_TEMP_ON_SUCCESS,
+                reason="success",
+            )
+            self.ui_call(self.finish_processing)
+        except Exception as e:
+            self.log_event("chunked_transcription_failed_fallback_batch", error=e)
+            try:
+                self.finish_chunk_transcription_queue()
+            except Exception as queue_error:
+                self.log_event("chunked_transcription_queue_shutdown_failed", error=queue_error)
+            self.cleanup_chunked_temp_dir(
+                keep=CHUNKED_KEEP_TEMP_ON_FAILURE,
+                reason="fallback_batch",
+            )
+            self.transcribe_audio()
 
     def transcribe_audio(self):
         self.log_event("transcribe_thread_started")
