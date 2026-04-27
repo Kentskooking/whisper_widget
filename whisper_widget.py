@@ -18,7 +18,7 @@ import struct
 import numpy as np
 import torch
 import warnings
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from ctypes import wintypes
 from datetime import datetime
 import soundfile as sf
@@ -921,6 +921,10 @@ class WhisperWidget(ctk.CTk):
         self.current_raw_backup_path = None
         self.chunk_spooler = None
         self.chunk_capture_chunks = []
+        self.chunk_transcribe_queue = None
+        self.chunk_transcribe_thread = None
+        self.chunk_transcribe_results = {}
+        self.chunk_transcribe_lock = threading.Lock()
         self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
         self.vad_client = PersistentVADWorkerClient(
             worker_script_path=self.vad_worker_path,
@@ -1086,6 +1090,14 @@ class WhisperWidget(ctk.CTk):
         root, _ = os.path.splitext(chunk["path"])
         return f"{root}_{suffix}.wav"
 
+    def base_transcribe_options(self):
+        return {
+            "condition_on_previous_text": False,
+            "language": WHISPER_LANGUAGE,
+            "logprob_threshold": -1.0,
+            "no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
+        }
+
     def process_chunk_audio(self, chunk):
         chunk_index = chunk.get("index")
         source_path = chunk["path"]
@@ -1238,6 +1250,129 @@ class WhisperWidget(ctk.CTk):
                 error=e,
                 total_seconds=f"{result['timings']['total_seconds']:.3f}",
             )
+            return result
+
+    def start_chunk_transcription_queue(self):
+        self.chunk_transcribe_queue = Queue(maxsize=CHUNKED_QUEUE_MAXSIZE)
+        self.chunk_transcribe_results = {}
+        self.chunk_transcribe_thread = threading.Thread(
+            target=self.chunk_transcription_worker_loop,
+            daemon=True,
+            name="chunk_transcription_worker",
+        )
+        self.chunk_transcribe_thread.start()
+        self.log_chunk_event("transcription_queue_started", queue_maxsize=CHUNKED_QUEUE_MAXSIZE)
+
+    def enqueue_chunk_for_transcription(self, chunk):
+        if self.chunk_transcribe_queue is None:
+            self.log_chunk_event("queue_missing", chunk_index=chunk.get("index"))
+            return False
+
+        try:
+            self.chunk_transcribe_queue.put(chunk, block=False)
+            self.log_chunk_event("queued", chunk_index=chunk.get("index"), file=chunk.get("path"))
+            return True
+        except Full:
+            self.log_chunk_event("queue_full", chunk_index=chunk.get("index"), file=chunk.get("path"))
+            return False
+
+    def finish_chunk_transcription_queue(self, timeout_seconds=None):
+        queue = self.chunk_transcribe_queue
+        thread = self.chunk_transcribe_thread
+        if queue is None or thread is None:
+            return []
+
+        queue.put(None)
+        thread.join(timeout=timeout_seconds)
+        if thread.is_alive():
+            self.log_chunk_event("transcription_queue_join_timeout", timeout_seconds=timeout_seconds)
+        else:
+            self.log_chunk_event("transcription_queue_finished", results=len(self.chunk_transcribe_results))
+
+        self.chunk_transcribe_queue = None
+        self.chunk_transcribe_thread = None
+        with self.chunk_transcribe_lock:
+            return [self.chunk_transcribe_results[index] for index in sorted(self.chunk_transcribe_results)]
+
+    def chunk_transcription_worker_loop(self):
+        while True:
+            chunk = self.chunk_transcribe_queue.get()
+            try:
+                if chunk is None:
+                    return
+
+                result = self.process_and_transcribe_chunk(chunk)
+                with self.chunk_transcribe_lock:
+                    self.chunk_transcribe_results[chunk.get("index")] = result
+            finally:
+                self.chunk_transcribe_queue.task_done()
+
+    def process_and_transcribe_chunk(self, chunk):
+        chunk_index = chunk.get("index")
+        result = {
+            "ok": False,
+            "chunk_index": chunk_index,
+            "text": "",
+            "source_path": chunk.get("path"),
+            "transcribed_path": None,
+            "processing": None,
+            "error": None,
+            "timings": {},
+        }
+
+        processing_result = self.process_chunk_audio(chunk)
+        result["processing"] = processing_result
+        if processing_result.get("no_speech"):
+            result["ok"] = True
+            self.log_chunk_event("whisper_skipped_no_speech", chunk_index=chunk_index)
+            return result
+
+        transcribe_path = processing_result.get("processed_path")
+        stage = "processed_chunk"
+        if not processing_result.get("ok") or not transcribe_path or not os.path.exists(transcribe_path):
+            transcribe_path = chunk.get("path")
+            stage = "raw_chunk_fallback"
+            self.log_chunk_event(
+                "processing_failed_fallback_raw",
+                chunk_index=chunk_index,
+                error=processing_result.get("error"),
+            )
+
+        if self.model is None:
+            result["error"] = "model_not_loaded"
+            self.log_chunk_event("whisper_failed", chunk_index=chunk_index, stage=stage, error=result["error"])
+            return result
+
+        result["transcribed_path"] = transcribe_path
+        try:
+            self.log_chunk_event("whisper_start", chunk_index=chunk_index, stage=stage, source=transcribe_path)
+            started = time.perf_counter()
+            whisper_result = self.model.transcribe(transcribe_path, **self.base_transcribe_options())
+            elapsed = time.perf_counter() - started
+            text = whisper_result["text"].strip()
+            result["text"] = text
+            result["timings"]["whisper_seconds"] = elapsed
+            result["ok"] = True
+
+            if text:
+                self.log_chunk_event(
+                    "whisper_success",
+                    chunk_index=chunk_index,
+                    stage=stage,
+                    chars=len(text),
+                    processing_seconds=f"{elapsed:.3f}",
+                )
+            else:
+                self.log_chunk_event(
+                    "whisper_no_text",
+                    chunk_index=chunk_index,
+                    stage=stage,
+                    processing_seconds=f"{elapsed:.3f}",
+                )
+            return result
+        except Exception as e:
+            result["error"] = str(e)
+            self.log_chunk_event("whisper_failed", chunk_index=chunk_index, stage=stage, error=e)
             return result
 
     def log_transcription(self, text):
@@ -1509,12 +1644,7 @@ class WhisperWidget(ctk.CTk):
             self.log_event("sound_error", error=e)
 
     def build_transcribe_attempts(self, speech_secs, processed_source):
-        base_options = {
-            "condition_on_previous_text": False,
-            "language": WHISPER_LANGUAGE,
-            "logprob_threshold": -1.0,
-            "no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
-        }
+        base_options = self.base_transcribe_options()
         attempt_candidates = []
 
         if speech_secs > 0.0 and processed_source:
