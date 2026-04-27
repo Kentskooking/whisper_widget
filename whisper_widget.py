@@ -4,7 +4,6 @@ import ctypes
 import customtkinter as ctk
 import pyaudio
 import wave
-import audioop
 import threading
 import time
 import sys
@@ -68,6 +67,7 @@ NOISE_REDUCTION_N_FFT = 512
 NORMALIZE_AUDIO_ENABLED = True
 NORMALIZE_TARGET_PEAK_DBFS = -4.0
 NORMALIZE_MAX_GAIN_DB = 16.0
+NORMALIZE_REQUEST_TIMEOUT_SECONDS = 60
 CHUNKED_TRANSCRIPTION_ENABLED = True
 CHUNKED_CHUNK_SECONDS = 30.0
 CHUNKED_OVERLAP_SECONDS = 1.5
@@ -940,75 +940,39 @@ def reduce_noise_wav_webrtc_apm_subprocess(
     )
 
 
-def normalize_wav(
+def normalize_wav_subprocess(
+    worker_script_path: str,
     in_wav_path: str,
     out_wav_path: str,
     target_peak_dbfs: float = NORMALIZE_TARGET_PEAK_DBFS,
     max_gain_db: float = NORMALIZE_MAX_GAIN_DB,
     target_sample_rate: int | None = SAMPLE_RATE,
+    timeout_seconds: float = NORMALIZE_REQUEST_TIMEOUT_SECONDS,
 ):
-    """Writes a conservatively peak-normalized mono PCM WAV.
+    """Runs WAV normalization in a child process so native crashes cannot kill the UI."""
+    command = [
+        sys.executable,
+        worker_script_path,
+        "--input",
+        in_wav_path,
+        "--output",
+        out_wav_path,
+        "--target-peak-dbfs",
+        str(target_peak_dbfs),
+        "--max-gain-db",
+        str(max_gain_db),
+    ]
+    if target_sample_rate:
+        command.extend(["--target-sample-rate", str(int(target_sample_rate))])
 
-    Keep this path independent of torch/torchaudio/CUDA. A Python exception here
-    can be handled by the caller; a native library access violation cannot.
-    """
-    with wave.open(in_wav_path, "rb") as reader:
-        channels = reader.getnchannels()
-        sample_width = reader.getsampwidth()
-        sample_rate = reader.getframerate()
-        compression = reader.getcomptype()
-        frames = reader.readframes(reader.getnframes())
-
-    if compression != "NONE":
-        raise ValueError(f"unsupported WAV compression: {compression}")
-    if sample_width != 2:
-        raise ValueError(f"normalize_wav only supports 16-bit PCM, got {sample_width * 8}-bit")
-    if channels == 2:
-        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
-        channels = 1
-    elif channels != 1:
-        raise ValueError(f"normalize_wav only supports mono/stereo WAV, got {channels} channels")
-
-    input_sample_rate = int(sample_rate)
-    if target_sample_rate and int(sample_rate) != int(target_sample_rate):
-        frames, _ = audioop.ratecv(
-            frames,
-            sample_width,
-            channels,
-            int(sample_rate),
-            int(target_sample_rate),
-            None,
-        )
-        sample_rate = int(target_sample_rate)
-
-    full_scale = float((1 << (8 * sample_width - 1)) - 1)
-    peak = float(audioop.max(frames, sample_width)) if frames else 0.0
-    if peak <= 0.0:
-        normalized_frames = frames
-        gain = 1.0
-        output_peak = 0.0
-    else:
-        target_peak = full_scale * (10 ** (target_peak_dbfs / 20.0))
-        max_gain = 10 ** (max_gain_db / 20.0)
-        gain = min(max_gain, max(1.0, target_peak / peak))
-        normalized_frames = audioop.mul(frames, sample_width, gain)
-        output_peak = float(audioop.max(normalized_frames, sample_width)) if normalized_frames else 0.0
-
-    with wave.open(out_wav_path, "wb") as writer:
-        writer.setnchannels(1)
-        writer.setsampwidth(sample_width)
-        writer.setframerate(int(sample_rate))
-        writer.writeframes(normalized_frames)
-
-    input_peak_dbfs = 20.0 * math.log10(max(peak / full_scale, 1e-12))
-    output_peak_dbfs = 20.0 * math.log10(max(output_peak / full_scale, 1e-12))
-    return {
-        "gain_db": 20.0 * math.log10(max(gain, 1e-12)),
-        "input_peak_dbfs": input_peak_dbfs,
-        "output_peak_dbfs": output_peak_dbfs,
-        "sample_rate": int(sample_rate),
-        "input_sample_rate": input_sample_rate,
-    }
+    result = run_json_subprocess(
+        command=command,
+        cwd=os.path.dirname(worker_script_path) or None,
+        timeout_seconds=timeout_seconds,
+    )
+    if not os.path.exists(out_wav_path) or os.path.getsize(out_wav_path) <= 0:
+        raise RuntimeError("normalizer produced an empty output file")
+    return result
 
 
 class ChunkCaptureSpooler:
@@ -1123,6 +1087,7 @@ class WhisperWidget(ctk.CTk):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.noise_reduce_worker_script = os.path.join(self.base_dir, "noise_reduce_worker.py")
         self.webrtc_apm_wrapper_script = os.path.join(self.base_dir, "webrtc_apm_wav_wrapper.py")
+        self.normalize_worker_script = os.path.join(self.base_dir, "normalize_worker.py")
         
         # Ensure Log Directory Exists
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -1159,6 +1124,12 @@ class WhisperWidget(ctk.CTk):
             device=WHISPER_DEVICE,
             ready_timeout_seconds=WHISPER_WORKER_READY_TIMEOUT_SECONDS,
             transcribe_timeout_seconds=WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
+        )
+        self.log_event(
+            "normalize_worker_config",
+            enabled=NORMALIZE_AUDIO_ENABLED,
+            timeout_seconds=NORMALIZE_REQUEST_TIMEOUT_SECONDS,
+            worker=self.normalize_worker_script,
         )
 
         # Window Setup
@@ -1513,26 +1484,41 @@ class WhisperWidget(ctk.CTk):
 
             if NORMALIZE_AUDIO_ENABLED and processed_source and os.path.exists(processed_source):
                 normalize_started = time.perf_counter()
-                stats = normalize_wav(
-                    processed_source,
-                    normalized_path,
-                    target_peak_dbfs=NORMALIZE_TARGET_PEAK_DBFS,
-                    max_gain_db=NORMALIZE_MAX_GAIN_DB,
-                )
-                processed_source = normalized_path
-                normalize_seconds = time.perf_counter() - normalize_started
-                result["timings"]["normalize_seconds"] = normalize_seconds
-                self.log_chunk_event(
-                    "normalize_complete",
-                    chunk_index=chunk_index,
-                    file=processed_source,
-                    gain_db=f"{stats['gain_db']:.2f}",
-                    input_peak_dbfs=f"{stats['input_peak_dbfs']:.2f}",
-                    output_peak_dbfs=f"{stats['output_peak_dbfs']:.2f}",
-                    input_sample_rate_hz=stats["input_sample_rate"],
-                    output_sample_rate_hz=stats["sample_rate"],
-                    processing_seconds=f"{normalize_seconds:.3f}",
-                )
+                normalize_input = processed_source
+                try:
+                    stats = normalize_wav_subprocess(
+                        self.normalize_worker_script,
+                        normalize_input,
+                        normalized_path,
+                        target_peak_dbfs=NORMALIZE_TARGET_PEAK_DBFS,
+                        max_gain_db=NORMALIZE_MAX_GAIN_DB,
+                        timeout_seconds=NORMALIZE_REQUEST_TIMEOUT_SECONDS,
+                    )
+                    processed_source = normalized_path
+                    normalize_seconds = time.perf_counter() - normalize_started
+                    result["timings"]["normalize_seconds"] = normalize_seconds
+                    self.log_chunk_event(
+                        "normalize_complete",
+                        chunk_index=chunk_index,
+                        file=processed_source,
+                        gain_db=f"{stats['gain_db']:.2f}",
+                        input_peak_dbfs=f"{stats['input_peak_dbfs']:.2f}",
+                        output_peak_dbfs=f"{stats['output_peak_dbfs']:.2f}",
+                        input_sample_rate_hz=stats["input_sample_rate"],
+                        output_sample_rate_hz=stats["sample_rate"],
+                        processing_seconds=f"{normalize_seconds:.3f}",
+                    )
+                except Exception as e:
+                    normalize_seconds = time.perf_counter() - normalize_started
+                    result["timings"]["normalize_seconds"] = normalize_seconds
+                    self.log_chunk_event(
+                        "normalize_failed_fallback_processed",
+                        chunk_index=chunk_index,
+                        source=normalize_input,
+                        attempted_output=normalized_path,
+                        error=e,
+                        processing_seconds=f"{normalize_seconds:.3f}",
+                    )
             else:
                 self.log_chunk_event("normalize_skipped", chunk_index=chunk_index)
 
@@ -2648,11 +2634,13 @@ class WhisperWidget(ctk.CTk):
             if NORMALIZE_AUDIO_ENABLED and processed_source and os.path.exists(processed_source):
                 self.log_event("normalize_start", source=processed_source)
                 try:
-                    stats = normalize_wav(
+                    stats = normalize_wav_subprocess(
+                        self.normalize_worker_script,
                         processed_source,
                         self.temp_normalized_filename,
                         target_peak_dbfs=NORMALIZE_TARGET_PEAK_DBFS,
                         max_gain_db=NORMALIZE_MAX_GAIN_DB,
+                        timeout_seconds=NORMALIZE_REQUEST_TIMEOUT_SECONDS,
                     )
                     processed_source = self.temp_normalized_filename
                     self.log_event(
@@ -2666,7 +2654,12 @@ class WhisperWidget(ctk.CTk):
                     )
                 except Exception as e:
                     print(f"Normalization failed, falling back to processed speech-only audio: {e}")
-                    self.log_event("normalize_failed_fallback_processed", error=e)
+                    self.log_event(
+                        "normalize_failed_fallback_processed",
+                        source=processed_source,
+                        attempted_output=self.temp_normalized_filename,
+                        error=e,
+                    )
         elif NORMALIZE_AUDIO_ENABLED:
             self.log_event("normalize_skipped", source="no_speech_or_vad_failure")
 
