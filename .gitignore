@@ -57,6 +57,10 @@ temp_*.wav
 oneoff_transcribe.py
 denoise_bakeoff_variants.local.json
 
+# Local working plans
+CHUNKED_PIPELINE_PLAN.md
+.codex
+
 # Environment variables
 .env
 .env.local
