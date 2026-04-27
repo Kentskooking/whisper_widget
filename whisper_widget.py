@@ -68,6 +68,13 @@ NOISE_REDUCTION_N_FFT = 512
 NORMALIZE_AUDIO_ENABLED = True
 NORMALIZE_TARGET_PEAK_DBFS = -4.0
 NORMALIZE_MAX_GAIN_DB = 16.0
+CHUNKED_TRANSCRIPTION_ENABLED = False
+CHUNKED_CHUNK_SECONDS = 30.0
+CHUNKED_OVERLAP_SECONDS = 1.5
+CHUNKED_QUEUE_MAXSIZE = 4
+CHUNKED_TEMP_DIR = "chunked_transcription_work"
+CHUNKED_KEEP_TEMP_ON_SUCCESS = False
+CHUNKED_KEEP_TEMP_ON_FAILURE = True
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -744,6 +751,7 @@ class WhisperWidget(ctk.CTk):
         self.event_log_path = os.path.join(self.base_dir, EVENT_LOG_FILE)
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
         self.raw_audio_backup_dir = os.path.join(self.base_dir, RAW_AUDIO_BACKUP_DIR)
+        self.chunked_temp_dir = os.path.join(self.base_dir, CHUNKED_TEMP_DIR)
         if SAVE_DEBUG_AUDIO:
             os.makedirs(self.debug_audio_dir, exist_ok=True)
         os.makedirs(self.raw_audio_backup_dir, exist_ok=True)
@@ -756,6 +764,14 @@ class WhisperWidget(ctk.CTk):
             model=MODEL_SIZE
         )
         self.log_event("event_log_initialized", file=self.event_log_path)
+        self.log_event(
+            "chunked_transcription_config",
+            enabled=CHUNKED_TRANSCRIPTION_ENABLED,
+            chunk_seconds=CHUNKED_CHUNK_SECONDS,
+            overlap_seconds=CHUNKED_OVERLAP_SECONDS,
+            queue_maxsize=CHUNKED_QUEUE_MAXSIZE,
+            temp_dir=self.chunked_temp_dir,
+        )
 
         # Window Setup
         self.title("Whisper")
@@ -863,6 +879,42 @@ class WhisperWidget(ctk.CTk):
             self.event_logger.log(event, **fields)
         except Exception:
             pass
+
+    def log_chunk_event(self, event, chunk_index=None, **fields):
+        if chunk_index is not None:
+            fields["chunk_index"] = chunk_index
+        self.log_event(f"chunk_{event}", **fields)
+
+    def is_safe_child_path(self, path, parent_dir):
+        try:
+            path_real = os.path.realpath(path)
+            parent_real = os.path.realpath(parent_dir)
+            return path_real != parent_real and os.path.commonpath([path_real, parent_real]) == parent_real
+        except Exception:
+            return False
+
+    def prepare_chunked_temp_dir(self):
+        os.makedirs(self.chunked_temp_dir, exist_ok=True)
+        self.log_chunk_event("temp_dir_ready", dir=self.chunked_temp_dir)
+        return self.chunked_temp_dir
+
+    def cleanup_chunked_temp_dir(self, keep=False, reason="success"):
+        if keep:
+            self.log_chunk_event("temp_dir_preserved", dir=self.chunked_temp_dir, reason=reason)
+            return
+
+        if not os.path.exists(self.chunked_temp_dir):
+            return
+
+        if not self.is_safe_child_path(self.chunked_temp_dir, self.base_dir):
+            self.log_chunk_event("temp_dir_cleanup_refused", dir=self.chunked_temp_dir, reason="unsafe_path")
+            return
+
+        try:
+            shutil.rmtree(self.chunked_temp_dir)
+            self.log_chunk_event("temp_dir_removed", dir=self.chunked_temp_dir, reason=reason)
+        except Exception as e:
+            self.log_chunk_event("temp_dir_remove_failed", dir=self.chunked_temp_dir, reason=reason, error=e)
 
     def log_transcription(self, text):
         """Appends transcription to a daily log file."""
