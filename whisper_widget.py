@@ -2,7 +2,6 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import ctypes
 import customtkinter as ctk
-import whisper
 import pyaudio
 import wave
 import audioop
@@ -15,8 +14,6 @@ import json
 import pyperclip
 import math
 import struct
-import numpy as np
-import torch
 import warnings
 from queue import Queue, Empty, Full
 from ctypes import wintypes
@@ -37,6 +34,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Configuration
 MODEL_SIZE = "large-v3"
+WHISPER_DEVICE = "auto"
+WHISPER_WORKER_READY_TIMEOUT_SECONDS = 120
+WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = 180
 HOTKEY = "f8"
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -544,6 +544,265 @@ class PersistentVADWorkerClient:
             self._terminate_locked(process, reason="close")
 
 
+class PersistentWhisperWorkerClient:
+    """Keeps Whisper/PyTorch in a separate process so native crashes do not kill the UI."""
+
+    def __init__(self, worker_script_path: str, workdir: str, model_size: str, device: str, log_fn):
+        self.worker_script_path = worker_script_path
+        self.workdir = workdir
+        self.model_size = model_size
+        self.device = device
+        self.log_fn = log_fn
+        self._lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self._process = None
+        self._stdout_thread = None
+        self._stderr_thread = None
+        self._response_queue = Queue()
+        self._ready_event = threading.Event()
+        self._ready = False
+        self._last_start_error = None
+        self._last_ready_payload = {}
+        self._request_id = 0
+
+    def _log(self, event, **fields):
+        try:
+            self.log_fn(event, **fields)
+        except Exception:
+            pass
+
+    def _is_current_process(self, process):
+        return process is not None and process is self._process
+
+    def _reset_state_locked(self):
+        self._process = None
+        self._stdout_thread = None
+        self._stderr_thread = None
+        self._response_queue = Queue()
+        self._ready_event = threading.Event()
+        self._ready = False
+        self._last_start_error = None
+        self._last_ready_payload = {}
+
+    def _start_locked(self):
+        command = [
+            sys.executable,
+            "-u",
+            self.worker_script_path,
+            "--server",
+            "--model",
+            self.model_size,
+            "--device",
+            self.device,
+        ]
+        self._reset_state_locked()
+        process = subprocess.Popen(
+            command,
+            cwd=self.workdir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._process = process
+        self._stdout_thread = threading.Thread(target=self._stdout_loop, args=(process,), daemon=True)
+        self._stderr_thread = threading.Thread(target=self._stderr_loop, args=(process,), daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+        self._log("whisper_worker_started", pid=process.pid, model=self.model_size, device=self.device)
+
+    def _stdout_loop(self, process):
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                try:
+                    message = json.loads(line)
+                except Exception as e:
+                    self._log("whisper_worker_stdout_invalid", pid=process.pid, error=e, line=line[-400:])
+                    continue
+
+                message_type = message.get("type")
+                if message_type == "ready":
+                    ready_payload = dict(message)
+                    ready_payload["launcher_pid"] = process.pid
+                    ready_payload["worker_pid"] = message.get("pid")
+                    with self._lock:
+                        is_current = self._is_current_process(process)
+                        if is_current:
+                            self._ready = bool(message.get("ok"))
+                            self._last_ready_payload = ready_payload
+                            self._last_start_error = None if self._ready else (message.get("error") or "unknown worker startup error")
+                            self._ready_event.set()
+                    if not is_current:
+                        continue
+                    if self._ready:
+                        self._log(
+                            "whisper_worker_ready",
+                            pid=process.pid,
+                            launcher_pid=process.pid,
+                            worker_pid=message.get("pid"),
+                            model=message.get("model"),
+                            device=message.get("device"),
+                            load_seconds=f"{float(message.get('load_seconds') or 0.0):.3f}",
+                        )
+                    else:
+                        self._log("whisper_worker_ready_failed", pid=process.pid, error=self._last_start_error)
+                elif message_type == "response":
+                    self._response_queue.put(message)
+                elif message_type == "shutdown_ack":
+                    self._log("whisper_worker_shutdown_ack", pid=process.pid)
+                else:
+                    self._log("whisper_worker_message_unknown", pid=process.pid, message_type=message_type)
+        finally:
+            returncode = process.poll()
+            with self._lock:
+                is_current = self._is_current_process(process)
+                if is_current:
+                    self._ready = False
+                    if not self._ready_event.is_set():
+                        self._last_start_error = f"worker exited before ready (code {returncode})"
+                        self._ready_event.set()
+            if is_current:
+                self._log("whisper_worker_exited", pid=process.pid, returncode=returncode)
+
+    def _stderr_loop(self, process):
+        try:
+            for raw_line in process.stderr:
+                line = raw_line.strip()
+                if line:
+                    self._log("whisper_worker_stderr", pid=process.pid, line=line[-400:])
+        except Exception as e:
+            self._log("whisper_worker_stderr_failed", pid=getattr(process, "pid", None), error=e)
+
+    def ensure_ready(self, timeout_seconds: int = WHISPER_WORKER_READY_TIMEOUT_SECONDS):
+        with self._lock:
+            process = self._process
+            if process is None or process.poll() is not None:
+                self._start_locked()
+            ready_event = self._ready_event
+
+        ready = ready_event.wait(timeout_seconds)
+        with self._lock:
+            process = self._process
+            if not ready:
+                self._terminate_locked(process, reason="startup_timeout")
+                raise RuntimeError(f"Whisper worker did not become ready within {timeout_seconds}s")
+            if process is None or process.poll() is not None:
+                error = self._last_start_error or "Whisper worker exited during startup"
+                raise RuntimeError(error)
+            if not self._ready:
+                raise RuntimeError(self._last_start_error or "Whisper worker failed to start")
+            return dict(self._last_ready_payload)
+
+    def is_ready(self):
+        with self._lock:
+            return bool(self._ready and self._process is not None and self._process.poll() is None)
+
+    def transcribe(
+        self,
+        audio_path: str,
+        options: dict,
+        timeout_seconds: int = WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
+    ) -> dict:
+        with self._request_lock:
+            self.ensure_ready()
+            with self._lock:
+                process = self._process
+                if process is None or process.poll() is not None or not self._ready:
+                    raise RuntimeError("Whisper worker is not available")
+
+                self._request_id += 1
+                request_id = self._request_id
+                response_queue = self._response_queue
+                request = {
+                    "type": "transcribe",
+                    "request_id": request_id,
+                    "audio_path": os.path.abspath(audio_path),
+                    "options": options or {},
+                }
+                try:
+                    process.stdin.write(json.dumps(request) + "\n")
+                    process.stdin.flush()
+                except Exception as e:
+                    self._terminate_locked(process, reason="request_send_failed")
+                    raise RuntimeError("Whisper worker pipe failed while sending request") from e
+
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with self._lock:
+                        if self._is_current_process(process):
+                            self._terminate_locked(process, reason="request_timeout")
+                    raise RuntimeError(f"Whisper worker timed out after {timeout_seconds}s")
+
+                try:
+                    message = response_queue.get(timeout=min(remaining, 0.25))
+                except Empty:
+                    with self._lock:
+                        process_alive = self._is_current_process(process) and process.poll() is None
+                    if not process_alive:
+                        raise RuntimeError(f"Whisper worker exited while processing audio (code {process.poll()})")
+                    continue
+
+                if message.get("request_id") != request_id:
+                    self._log(
+                        "whisper_worker_response_unexpected",
+                        expected_request_id=request_id,
+                        actual_request_id=message.get("request_id"),
+                    )
+                    continue
+
+                if not message.get("ok"):
+                    error_text = message.get("error") or "Whisper worker reported an unknown error"
+                    raise RuntimeError(error_text)
+
+                return message
+
+    def _terminate_locked(self, process, reason: str):
+        if process is None:
+            return
+        if self._is_current_process(process):
+            self._reset_state_locked()
+
+        try:
+            if process.poll() is None and process.stdin:
+                process.stdin.write(json.dumps({"type": "shutdown"}) + "\n")
+                process.stdin.flush()
+        except Exception:
+            pass
+
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2.0)
+            except Exception:
+                pass
+
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2.0)
+            except Exception:
+                pass
+
+        if process.poll() is None:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+        self._log("whisper_worker_terminated", pid=getattr(process, "pid", None), reason=reason, returncode=process.poll())
+
+    def close(self):
+        with self._lock:
+            process = self._process
+            self._terminate_locked(process, reason="close")
+
+
 def reduce_noise_wav(
     in_wav_path: str,
     out_wav_path: str,
@@ -883,6 +1142,13 @@ class WhisperWidget(ctk.CTk):
             save_debug_artifacts=CHUNKED_SAVE_DEBUG_ARTIFACTS,
             temp_dir=self.chunked_temp_dir,
         )
+        self.log_event(
+            "whisper_worker_config",
+            model=MODEL_SIZE,
+            device=WHISPER_DEVICE,
+            ready_timeout_seconds=WHISPER_WORKER_READY_TIMEOUT_SECONDS,
+            transcribe_timeout_seconds=WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
+        )
 
         # Window Setup
         self.title("Whisper")
@@ -931,9 +1197,17 @@ class WhisperWidget(ctk.CTk):
         self.chunk_transcribe_lock = threading.Lock()
         self.chunk_pipeline_failed = False
         self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
+        self.whisper_worker_path = os.path.join(self.base_dir, "whisper_transcribe_worker.py")
         self.vad_client = PersistentVADWorkerClient(
             worker_script_path=self.vad_worker_path,
             workdir=self.base_dir,
+            log_fn=self.log_event,
+        )
+        self.whisper_client = PersistentWhisperWorkerClient(
+            worker_script_path=self.whisper_worker_path,
+            workdir=self.base_dir,
+            model_size=MODEL_SIZE,
+            device=WHISPER_DEVICE,
             log_fn=self.log_event,
         )
         self.log_event("audio_init_ok")
@@ -957,7 +1231,7 @@ class WhisperWidget(ctk.CTk):
         self.mute_label.place(relx=0.8, rely=0.2, anchor="center")
 
         # Load Model in Background
-        self.model = None
+        self.whisper_ready = False
         self.status_label = ctk.CTkLabel(self, text="Loading Model...", font=("Arial", 10))
         self.status_label.grid(row=1, column=0, pady=(0, 5))
         
@@ -1364,7 +1638,7 @@ class WhisperWidget(ctk.CTk):
                 error=processing_result.get("error"),
             )
 
-        if self.model is None:
+        if not self.is_whisper_ready():
             result["error"] = "model_not_loaded"
             self.log_chunk_event("whisper_failed", chunk_index=chunk_index, stage=stage, error=result["error"])
             return result
@@ -1373,9 +1647,17 @@ class WhisperWidget(ctk.CTk):
         try:
             self.log_chunk_event("whisper_start", chunk_index=chunk_index, stage=stage, source=transcribe_path)
             started = time.perf_counter()
-            whisper_result = self.model.transcribe(transcribe_path, **self.base_transcribe_options())
+            request_timeout = min(
+                WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
+                max(5, CHUNKED_FINALIZE_TIMEOUT_SECONDS - 5),
+            )
+            whisper_result = self.transcribe_with_whisper(
+                transcribe_path,
+                self.base_transcribe_options(),
+                timeout_seconds=request_timeout,
+            )
             elapsed = time.perf_counter() - started
-            text = whisper_result["text"].strip()
+            text = (whisper_result.get("text") or "").strip()
             result["text"] = text
             result["timings"]["whisper_seconds"] = elapsed
             result["ok"] = True
@@ -1624,13 +1906,19 @@ class WhisperWidget(ctk.CTk):
             self.log_event("transcription_log_failed", error=e)
 
     def load_model(self):
-        """Loads the Whisper model on a background thread."""
-# Note: cuda:1 actually maps to A6000 due to CUDA_VISIBLE_DEVICES remapping
+        """Starts the persistent Whisper worker on a background thread."""
         try:
-            device = "cuda:1" if torch.cuda.is_available() else "cpu"
-            print(f"Loading model on {device}...")
-            self.log_event("model_load_start", device=device, model=MODEL_SIZE)
-            self.model = whisper.load_model(MODEL_SIZE, device=device)
+            print("Starting Whisper worker...")
+            self.log_event(
+                "model_load_start",
+                device=WHISPER_DEVICE,
+                model=MODEL_SIZE,
+                worker=self.whisper_worker_path,
+            )
+            ready_payload = self.whisper_client.ensure_ready(
+                timeout_seconds=WHISPER_WORKER_READY_TIMEOUT_SECONDS,
+            )
+            self.whisper_ready = True
             try:
                 self.log_event("vad_worker_prewarm_start")
                 self.vad_client.ensure_ready()
@@ -1639,13 +1927,30 @@ class WhisperWidget(ctk.CTk):
                 print(f"VAD worker prewarm failed: {vad_error}")
                 self.log_event("vad_worker_prewarm_failed", error=vad_error)
             self.ui_call(self.update_ui_state, "ready")
-            print("Model loaded.")
-            self.log_event("model_load_success", device=device)
+            print("Whisper worker ready.")
+            self.log_event(
+                "model_load_success",
+                device=ready_payload.get("device"),
+                model=ready_payload.get("model"),
+                launcher_pid=ready_payload.get("launcher_pid"),
+                worker_pid=ready_payload.get("pid"),
+            )
             self.play_sound(1000, 100)
         except Exception as e:
+            self.whisper_ready = False
             self.ui_call(self.status_label.configure, text="Error Loading")
             print(f"Error loading model: {e}")
             self.log_event("model_load_failed", error=e)
+
+    def is_whisper_ready(self):
+        return bool(self.whisper_ready)
+
+    def transcribe_with_whisper(self, audio_path, options, timeout_seconds=WHISPER_TRANSCRIBE_TIMEOUT_SECONDS):
+        return self.whisper_client.transcribe(
+            audio_path,
+            options or {},
+            timeout_seconds=timeout_seconds,
+        )
 
     def ui_call(self, fn, *args, **kwargs):
         """Runs UI work on the Tk main thread."""
@@ -2029,7 +2334,7 @@ class WhisperWidget(ctk.CTk):
             self.ui_call(self.toggle_recording)
             return
 
-        if self.model is None:
+        if not self.is_whisper_ready():
             self.log_event("toggle_ignored_model_not_ready")
             return # Model not loaded yet
 
@@ -2328,12 +2633,12 @@ class WhisperWidget(ctk.CTk):
                     stage=attempt["label"],
                     source=attempt["path"]
                 )
-                result = self.model.transcribe(
+                result = self.transcribe_with_whisper(
                     attempt["path"],
-                    **attempt["options"],
+                    attempt["options"],
                 )
                 completed_attempts += 1
-                text = result["text"].strip()
+                text = (result.get("text") or "").strip()
 
                 if text:
                     print("\n[transcription]")
@@ -2447,6 +2752,7 @@ class WhisperWidget(ctk.CTk):
         self.log_event("app_close_start")
         self.shutdown_event.set()
         self.unregister_hotkey()
+        self.whisper_client.close()
         self.vad_client.close()
         try:
             if self.stream:
