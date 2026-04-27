@@ -52,6 +52,7 @@ event_log.*.txt
 
 # Local temp artifacts
 temp_*.wav
+chunked_transcription_work/
 
 # Local one-off utilities
 oneoff_transcribe.py

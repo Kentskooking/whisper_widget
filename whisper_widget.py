@@ -739,6 +739,113 @@ def normalize_wav(
         "input_sample_rate": input_sample_rate,
     }
 
+
+class ChunkCaptureSpooler:
+    def __init__(
+        self,
+        output_dir: str,
+        sample_rate: int,
+        channels: int,
+        sample_width: int,
+        chunk_seconds: float,
+        overlap_seconds: float,
+        log_fn,
+    ):
+        self.output_dir = output_dir
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self.sample_width = int(sample_width)
+        self.chunk_samples = max(1, int(round(float(chunk_seconds) * self.sample_rate)))
+        requested_overlap = max(0, int(round(float(overlap_seconds) * self.sample_rate)))
+        self.overlap_samples = min(requested_overlap, max(0, self.chunk_samples - 1))
+        self.bytes_per_sample_frame = self.channels * self.sample_width
+        self.log_fn = log_fn
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.buffer = bytearray()
+        self.buffer_start_sample = 0
+        self.total_samples_received = 0
+        self.last_chunk_end_sample = 0
+        self.next_chunk_index = 0
+        self.chunks = []
+
+    def add_frame(self, data: bytes):
+        if not data:
+            return []
+
+        if len(data) % self.bytes_per_sample_frame != 0:
+            raise ValueError("audio frame byte length is not aligned to sample frame size")
+
+        self.buffer.extend(data)
+        self.total_samples_received += len(data) // self.bytes_per_sample_frame
+        return self._flush_complete_chunks()
+
+    def finalize(self):
+        if self.total_samples_received > self.last_chunk_end_sample and self.buffer:
+            self._write_chunk(
+                start_sample=self.buffer_start_sample,
+                end_sample=self.total_samples_received,
+                is_final=True,
+            )
+        return list(self.chunks)
+
+    def _flush_complete_chunks(self):
+        written = []
+        while self.total_samples_received - self.buffer_start_sample >= self.chunk_samples:
+            start_sample = self.buffer_start_sample
+            end_sample = start_sample + self.chunk_samples
+            chunk = self._write_chunk(
+                start_sample=start_sample,
+                end_sample=end_sample,
+                is_final=False,
+            )
+            written.append(chunk)
+
+            keep_start_sample = end_sample - self.overlap_samples
+            drop_samples = keep_start_sample - self.buffer_start_sample
+            drop_bytes = drop_samples * self.bytes_per_sample_frame
+            del self.buffer[:drop_bytes]
+            self.buffer_start_sample = keep_start_sample
+
+        return written
+
+    def _write_chunk(self, start_sample: int, end_sample: int, is_final: bool):
+        sample_count = max(0, end_sample - start_sample)
+        byte_count = sample_count * self.bytes_per_sample_frame
+        chunk_audio = bytes(self.buffer[:byte_count])
+        chunk_index = self.next_chunk_index
+        self.next_chunk_index += 1
+
+        filename = f"chunk_{chunk_index:04d}_{start_sample:010d}_{end_sample:010d}.wav"
+        path = os.path.join(self.output_dir, filename)
+        with wave.open(path, "wb") as writer:
+            writer.setnchannels(self.channels)
+            writer.setsampwidth(self.sample_width)
+            writer.setframerate(self.sample_rate)
+            writer.writeframes(chunk_audio)
+
+        chunk = {
+            "index": chunk_index,
+            "path": path,
+            "start_sample": start_sample,
+            "end_sample": end_sample,
+            "seconds": sample_count / self.sample_rate,
+            "is_final": is_final,
+        }
+        self.chunks.append(chunk)
+        self.last_chunk_end_sample = max(self.last_chunk_end_sample, end_sample)
+
+        self.log_fn(
+            "created",
+            chunk_index=chunk_index,
+            file=path,
+            start_sample=start_sample,
+            end_sample=end_sample,
+            seconds=f"{chunk['seconds']:.3f}",
+            final=is_final,
+        )
+        return chunk
+
+
 class WhisperWidget(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -812,6 +919,8 @@ class WhisperWidget(ctk.CTk):
         self.temp_normalized_filename = "temp_normalized.wav"
         self.temp_speech_filename = "temp_speech_only.wav"
         self.current_raw_backup_path = None
+        self.chunk_spooler = None
+        self.chunk_capture_chunks = []
         self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
         self.vad_client = PersistentVADWorkerClient(
             worker_script_path=self.vad_worker_path,
@@ -915,6 +1024,63 @@ class WhisperWidget(ctk.CTk):
             self.log_chunk_event("temp_dir_removed", dir=self.chunked_temp_dir, reason=reason)
         except Exception as e:
             self.log_chunk_event("temp_dir_remove_failed", dir=self.chunked_temp_dir, reason=reason, error=e)
+
+    def start_chunk_capture(self):
+        self.chunk_spooler = None
+        self.chunk_capture_chunks = []
+        if not CHUNKED_TRANSCRIPTION_ENABLED:
+            return
+
+        try:
+            self.cleanup_chunked_temp_dir(keep=False, reason="recording_start")
+            temp_dir = self.prepare_chunked_temp_dir()
+            sample_width = self.p.get_sample_size(pyaudio.paInt16)
+            self.chunk_spooler = ChunkCaptureSpooler(
+                output_dir=temp_dir,
+                sample_rate=SAMPLE_RATE,
+                channels=CHANNELS,
+                sample_width=sample_width,
+                chunk_seconds=CHUNKED_CHUNK_SECONDS,
+                overlap_seconds=CHUNKED_OVERLAP_SECONDS,
+                log_fn=self.log_chunk_event,
+            )
+            self.log_chunk_event(
+                "capture_started",
+                chunk_seconds=CHUNKED_CHUNK_SECONDS,
+                overlap_seconds=CHUNKED_OVERLAP_SECONDS,
+                sample_rate=SAMPLE_RATE,
+                channels=CHANNELS,
+                sample_width=sample_width,
+            )
+        except Exception as e:
+            self.chunk_spooler = None
+            self.log_chunk_event("capture_start_failed", error=e)
+
+    def record_chunk_frame(self, data):
+        if self.chunk_spooler is None:
+            return
+
+        try:
+            self.chunk_spooler.add_frame(data)
+        except Exception as e:
+            self.log_chunk_event("capture_frame_failed", error=e)
+            self.chunk_spooler = None
+
+    def finalize_chunk_capture(self, reason="recording_stop"):
+        if self.chunk_spooler is None:
+            return
+
+        try:
+            self.chunk_capture_chunks = self.chunk_spooler.finalize()
+            self.log_chunk_event(
+                "capture_finalized",
+                chunks=len(self.chunk_capture_chunks),
+                reason=reason,
+            )
+        except Exception as e:
+            self.log_chunk_event("capture_finalize_failed", reason=reason, error=e)
+        finally:
+            self.chunk_spooler = None
 
     def log_transcription(self, text):
         """Appends transcription to a daily log file."""
@@ -1356,6 +1522,7 @@ class WhisperWidget(ctk.CTk):
     def start_recording(self):
         self.is_recording = True
         self.audio_frames = []
+        self.start_chunk_capture()
         self.update_ui_state("recording")
         self.log_event("recording_started")
 
@@ -1382,6 +1549,7 @@ class WhisperWidget(ctk.CTk):
             try:
                 data = self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 self.audio_frames.append(data)
+                self.record_chunk_frame(data)
             except Exception as e:
                 print(f"Record loop error: {e}")
                 self.log_event("record_loop_error", error=e)
@@ -1397,6 +1565,7 @@ class WhisperWidget(ctk.CTk):
             self.stream.stop_stream()
             self.stream.close()
             self.stream = None
+        self.finalize_chunk_capture()
 
         self.play_sound(400, 100) # Low Beep
 
