@@ -71,10 +71,12 @@ NORMALIZE_MAX_GAIN_DB = 16.0
 CHUNKED_TRANSCRIPTION_ENABLED = False
 CHUNKED_CHUNK_SECONDS = 30.0
 CHUNKED_OVERLAP_SECONDS = 1.5
-CHUNKED_QUEUE_MAXSIZE = 4
+CHUNKED_QUEUE_MAXSIZE = 0
+CHUNKED_FINALIZE_TIMEOUT_SECONDS = 300
 CHUNKED_TEMP_DIR = "chunked_transcription_work"
 CHUNKED_KEEP_TEMP_ON_SUCCESS = False
 CHUNKED_KEEP_TEMP_ON_FAILURE = True
+CHUNKED_SAVE_DEBUG_ARTIFACTS = True
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -877,6 +879,8 @@ class WhisperWidget(ctk.CTk):
             chunk_seconds=CHUNKED_CHUNK_SECONDS,
             overlap_seconds=CHUNKED_OVERLAP_SECONDS,
             queue_maxsize=CHUNKED_QUEUE_MAXSIZE,
+            finalize_timeout_seconds=CHUNKED_FINALIZE_TIMEOUT_SECONDS,
+            save_debug_artifacts=CHUNKED_SAVE_DEBUG_ARTIFACTS,
             temp_dir=self.chunked_temp_dir,
         )
 
@@ -1270,15 +1274,19 @@ class WhisperWidget(ctk.CTk):
             return result
 
     def start_chunk_transcription_queue(self):
-        self.chunk_transcribe_queue = Queue(maxsize=CHUNKED_QUEUE_MAXSIZE)
-        self.chunk_transcribe_results = {}
+        queue_maxsize = max(0, int(CHUNKED_QUEUE_MAXSIZE))
+        queue = Queue(maxsize=queue_maxsize)
+        results = {}
+        self.chunk_transcribe_queue = queue
+        self.chunk_transcribe_results = results
         self.chunk_transcribe_thread = threading.Thread(
             target=self.chunk_transcription_worker_loop,
+            args=(queue, results),
             daemon=True,
             name="chunk_transcription_worker",
         )
         self.chunk_transcribe_thread.start()
-        self.log_chunk_event("transcription_queue_started", queue_maxsize=CHUNKED_QUEUE_MAXSIZE)
+        self.log_chunk_event("transcription_queue_started", queue_maxsize=queue_maxsize)
 
     def enqueue_chunk_for_transcription(self, chunk):
         if self.chunk_transcribe_queue is None:
@@ -1293,7 +1301,7 @@ class WhisperWidget(ctk.CTk):
             self.log_chunk_event("queue_full", chunk_index=chunk.get("index"), file=chunk.get("path"))
             return False
 
-    def finish_chunk_transcription_queue(self, timeout_seconds=None):
+    def finish_chunk_transcription_queue(self, timeout_seconds=CHUNKED_FINALIZE_TIMEOUT_SECONDS):
         queue = self.chunk_transcribe_queue
         thread = self.chunk_transcribe_thread
         if queue is None or thread is None:
@@ -1303,6 +1311,7 @@ class WhisperWidget(ctk.CTk):
         thread.join(timeout=timeout_seconds)
         if thread.is_alive():
             self.log_chunk_event("transcription_queue_join_timeout", timeout_seconds=timeout_seconds)
+            raise TimeoutError(f"chunk transcription queue did not finish within {timeout_seconds}s")
         else:
             self.log_chunk_event("transcription_queue_finished", results=len(self.chunk_transcribe_results))
 
@@ -1311,18 +1320,18 @@ class WhisperWidget(ctk.CTk):
         with self.chunk_transcribe_lock:
             return [self.chunk_transcribe_results[index] for index in sorted(self.chunk_transcribe_results)]
 
-    def chunk_transcription_worker_loop(self):
+    def chunk_transcription_worker_loop(self, queue, results):
         while True:
-            chunk = self.chunk_transcribe_queue.get()
+            chunk = queue.get()
             try:
                 if chunk is None:
                     return
 
                 result = self.process_and_transcribe_chunk(chunk)
                 with self.chunk_transcribe_lock:
-                    self.chunk_transcribe_results[chunk.get("index")] = result
+                    results[chunk.get("index")] = result
             finally:
-                self.chunk_transcribe_queue.task_done()
+                queue.task_done()
 
     def process_and_transcribe_chunk(self, chunk):
         chunk_index = chunk.get("index")
@@ -1438,6 +1447,58 @@ class WhisperWidget(ctk.CTk):
                 continue
             stitched = self.merge_transcript_overlap(stitched, text)
         return stitched.strip()
+
+    def write_chunk_transcript_debug(self, chunk_results, stitched_text, reason):
+        if not SAVE_DEBUG_AUDIO or not CHUNKED_SAVE_DEBUG_ARTIFACTS:
+            return None
+
+        try:
+            debug_dir = os.path.join(self.debug_audio_dir, "chunked_transcripts")
+            os.makedirs(debug_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            output_path = os.path.join(debug_dir, f"chunked_{timestamp}_{reason}.json")
+            payload = {
+                "reason": reason,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "stitched_chars": len(stitched_text or ""),
+                "stitched_text": stitched_text or "",
+                "chunks": [],
+            }
+
+            for result in sorted(chunk_results, key=lambda item: item.get("chunk_index", -1)):
+                processing = result.get("processing") or {}
+                payload["chunks"].append({
+                    "chunk_index": result.get("chunk_index"),
+                    "ok": result.get("ok"),
+                    "text": result.get("text") or "",
+                    "chars": len(result.get("text") or ""),
+                    "source_path": result.get("source_path"),
+                    "transcribed_path": result.get("transcribed_path"),
+                    "error": result.get("error"),
+                    "timings": result.get("timings") or {},
+                    "processing": {
+                        "ok": processing.get("ok"),
+                        "no_speech": processing.get("no_speech"),
+                        "speech_secs": processing.get("speech_secs"),
+                        "processed_path": processing.get("processed_path"),
+                        "error": processing.get("error"),
+                        "timings": processing.get("timings") or {},
+                    },
+                })
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+
+            self.log_chunk_event(
+                "transcript_debug_saved",
+                file=output_path,
+                chunks=len(payload["chunks"]),
+                reason=reason,
+            )
+            return output_path
+        except Exception as e:
+            self.log_chunk_event("transcript_debug_save_failed", reason=reason, error=e)
+            return None
 
     def log_transcription(self, text):
         """Appends transcription to a daily log file."""
@@ -1937,6 +1998,7 @@ class WhisperWidget(ctk.CTk):
 
     def finalize_chunked_transcription(self):
         self.log_event("chunked_transcription_pipeline_start", chunks=len(self.chunk_capture_chunks))
+        chunk_results = []
 
         try:
             if self.chunk_pipeline_failed:
@@ -1948,6 +2010,7 @@ class WhisperWidget(ctk.CTk):
                 raise RuntimeError(f"chunk_transcription_failures={len(failed_results)}")
 
             text = self.stitch_chunk_transcripts(chunk_results)
+            self.write_chunk_transcript_debug(chunk_results, text, reason="success")
             if text:
                 print("\n[transcription]")
                 print(text)
@@ -1979,14 +2042,37 @@ class WhisperWidget(ctk.CTk):
             self.ui_call(self.finish_processing)
         except Exception as e:
             self.log_event("chunked_transcription_failed_fallback_batch", error=e)
-            try:
-                self.finish_chunk_transcription_queue()
-            except Exception as queue_error:
-                self.log_event("chunked_transcription_queue_shutdown_failed", error=queue_error)
+            with self.chunk_transcribe_lock:
+                partial_results = [
+                    self.chunk_transcribe_results[index]
+                    for index in sorted(self.chunk_transcribe_results)
+                ]
+            self.write_chunk_transcript_debug(partial_results or chunk_results, "", reason="failure")
+
+            worker_active = (
+                self.chunk_transcribe_thread is not None
+                and self.chunk_transcribe_thread.is_alive()
+            )
+            if worker_active:
+                try:
+                    self.finish_chunk_transcription_queue(timeout_seconds=30)
+                    worker_active = False
+                except Exception as queue_error:
+                    worker_active = (
+                        self.chunk_transcribe_thread is not None
+                        and self.chunk_transcribe_thread.is_alive()
+                    )
+                    self.log_event("chunked_transcription_queue_shutdown_failed", error=queue_error)
+
             self.cleanup_chunked_temp_dir(
                 keep=CHUNKED_KEEP_TEMP_ON_FAILURE,
                 reason="fallback_batch",
             )
+            if worker_active:
+                self.log_event("chunked_transcription_fallback_skipped_worker_active")
+                self.ui_call(self.finish_processing)
+                return
+
             self.transcribe_audio()
 
     def transcribe_audio(self):
