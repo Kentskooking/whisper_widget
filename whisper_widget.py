@@ -1375,6 +1375,53 @@ class WhisperWidget(ctk.CTk):
             self.log_chunk_event("whisper_failed", chunk_index=chunk_index, stage=stage, error=e)
             return result
 
+    def transcript_words_for_match(self, text):
+        words = []
+        for raw_word in text.split():
+            normalized = raw_word.strip().lower().strip(".,!?;:\"'()[]{}")
+            if normalized:
+                words.append(normalized)
+        return words
+
+    def merge_transcript_overlap(self, existing_text, next_text, max_overlap_words=16):
+        existing_text = (existing_text or "").strip()
+        next_text = (next_text or "").strip()
+        if not existing_text:
+            return next_text
+        if not next_text:
+            return existing_text
+
+        existing_words = self.transcript_words_for_match(existing_text)
+        next_words = self.transcript_words_for_match(next_text)
+        max_overlap = min(max_overlap_words, len(existing_words), len(next_words))
+        overlap_words = 0
+        for size in range(max_overlap, 0, -1):
+            if existing_words[-size:] == next_words[:size]:
+                overlap_words = size
+                break
+
+        if overlap_words == 0:
+            return f"{existing_text} {next_text}"
+
+        next_original_words = next_text.split()
+        remaining_next = " ".join(next_original_words[overlap_words:]).strip()
+        if not remaining_next:
+            return existing_text
+        if existing_text[-1:] in ".!?" and remaining_next[:1].islower():
+            existing_text = existing_text.rstrip(".!?")
+        return f"{existing_text} {remaining_next}"
+
+    def stitch_chunk_transcripts(self, chunk_results):
+        stitched = ""
+        for result in sorted(chunk_results, key=lambda item: item.get("chunk_index", -1)):
+            if not result.get("ok"):
+                continue
+            text = (result.get("text") or "").strip()
+            if not text:
+                continue
+            stitched = self.merge_transcript_overlap(stitched, text)
+        return stitched.strip()
+
     def log_transcription(self, text):
         """Appends transcription to a daily log file."""
         try:
