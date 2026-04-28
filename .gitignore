@@ -54,6 +54,16 @@ event_log.*.txt
 temp_*.wav
 chunked_transcription_work/
 
+# Local audio/media artifacts
+*.wav
+*.raw
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.webm
+
 # Local one-off utilities
 oneoff_transcribe.py
 denoise_bakeoff_variants.local.json

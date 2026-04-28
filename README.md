@@ -46,6 +46,12 @@ python -m pip install --upgrade pip "setuptools<81"
 python -m pip install --no-build-isolation -r requirements.txt
 ```
 
+### WSL WebRTC noise reduction
+The default noise-reduction backend is `webrtc_apm_wsl`, which runs the native
+WebRTC Audio Processing Module helper through WSL. See
+[docs/WSL_WEBRTC_APM.md](docs/WSL_WEBRTC_APM.md) for the Ubuntu dependencies,
+build command, direct test command, widget configuration, and git hygiene notes.
+
 ## Controls
 - **Click & Drag:** Move the widget.
 - **F8:** Toggle recording (Global Hotkey).
@@ -61,3 +67,4 @@ You can edit the `Configuration` section at the top of `whisper_widget.py` to ch
 - `NORMALIZE_AUDIO_ENABLED`, `NORMALIZE_TARGET_PEAK_DBFS`, `NORMALIZE_MAX_GAIN_DB` - Tune conservative peak normalization after denoise.
 - `SAVE_DEBUG_AUDIO` - Keep or disable timestamped debug audio capture under `debug_audio/`.
 - `EVENT_LOG_MAX_BYTES`, `EVENT_LOG_BACKUP_COUNT` - Control event log rotation size and retained archives.
+- `NOISE_REDUCTION_BACKEND`, `NOISE_REDUCTION_WEBRTC_PRESET`, `NOISE_REDUCTION_WEBRTC_DISTRO` - Configure the WSL WebRTC APM helper.
