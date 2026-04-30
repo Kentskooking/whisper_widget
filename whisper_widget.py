@@ -1333,9 +1333,19 @@ class WhisperWidget(ctk.CTk):
         if self.current_raw_backup_path and not payload.get("raw_backup_path"):
             payload["raw_backup_path"] = self.current_raw_backup_path
 
-        with self.runtime_state_lock:
-            write_json_atomic(self.runtime_recovery_path, payload)
         self.recovery_state = payload
+        try:
+            with self.runtime_state_lock:
+                write_json_atomic(self.runtime_recovery_path, payload)
+        except Exception as e:
+            self.log_event(
+                "recovery_state_write_failed",
+                mode=payload.get("mode"),
+                stage=payload.get("stage"),
+                error=e,
+            )
+            return False
+        return True
 
     def clear_recovery_state(self, reason="cleared"):
         had_state = os.path.exists(self.runtime_recovery_path)
