@@ -33,6 +33,7 @@ venv/
 env/
 ENV/
 .venv
+.ruff_cache/
 
 # IDE
 .vscode/

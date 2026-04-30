@@ -46,6 +46,22 @@ python -m pip install --upgrade pip "setuptools<81"
 python -m pip install --no-build-isolation -r requirements.txt
 ```
 
+### Dev checks
+Install the dev-only verifier tooling into the same `.venv`:
+```bat
+python -m pip install -r requirements-dev.txt
+```
+
+Run the deterministic local checks:
+```powershell
+.\tools\check_all.ps1
+```
+
+That runner performs:
+- in-memory Python syntax compilation for repo `.py` files that are not git-ignored
+- `ruff check` on the same repo `.py` files with a minimal low-noise ruleset (`E9` and `F`)
+- `git diff --check` for whitespace and patch hygiene
+
 ### WSL WebRTC noise reduction
 The default noise-reduction backend is `webrtc_apm_wsl`, which runs the native
 WebRTC Audio Processing Module helper through WSL. See

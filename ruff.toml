@@ -1,0 +1,17 @@
+target-version = "py310"
+line-length = 100
+force-exclude = true
+
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "bakeoff_outputs",
+    "debug_audio",
+    "raw_audio_backups",
+    "sidecache",
+    "transcriptions",
+]
+
+[lint]
+select = ["E9", "F"]
