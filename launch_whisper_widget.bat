@@ -25,8 +25,8 @@ if not %ERRORLEVEL% EQU 0 (
     "%PYTHON_EXE%" -m pip install --no-build-isolation -r requirements.txt || goto :error
 )
 
-echo [run] Starting Whisper Widget...
-"%PYTHON_EXE%" whisper_widget.py
+echo [run] Starting Whisper Widget supervisor...
+"%PYTHON_EXE%" whisper_supervisor.py
 set "EXIT_CODE=%ERRORLEVEL%"
 endlocal & exit /b %EXIT_CODE%
 

@@ -10,6 +10,7 @@ import sys
 import shutil
 import subprocess
 import json
+import re
 import pyperclip
 import math
 import struct
@@ -78,6 +79,9 @@ CHUNKED_KEEP_TEMP_ON_SUCCESS = False
 CHUNKED_KEEP_TEMP_ON_FAILURE = True
 CHUNKED_SAVE_DEBUG_ARTIFACTS = True
 CHUNKED_WHISPER_MAX_ATTEMPTS = 2
+RUNTIME_STATE_DIR = os.path.join("sidecache", "runtime")
+WIDGET_HEARTBEAT_FILE = "widget_heartbeat.json"
+WIDGET_RECOVERY_FILE = "widget_recovery.json"
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -197,6 +201,16 @@ def parse_hotkey_for_win32(hotkey: str):
     if vk is None:
         return None
     return mods, vk
+
+
+def write_json_atomic(path: str, payload):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(temp_path, path)
 
 
 class EventLogger:
@@ -1085,12 +1099,18 @@ class WhisperWidget(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.runtime_state_dir = os.path.join(self.base_dir, RUNTIME_STATE_DIR)
+        self.runtime_heartbeat_path = os.path.join(self.runtime_state_dir, WIDGET_HEARTBEAT_FILE)
+        self.runtime_recovery_path = os.path.join(self.runtime_state_dir, WIDGET_RECOVERY_FILE)
+        self.runtime_session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        self.runtime_state_lock = threading.Lock()
         self.noise_reduce_worker_script = os.path.join(self.base_dir, "noise_reduce_worker.py")
         self.webrtc_apm_wrapper_script = os.path.join(self.base_dir, "webrtc_apm_wav_wrapper.py")
         self.normalize_worker_script = os.path.join(self.base_dir, "normalize_worker.py")
         
         # Ensure Log Directory Exists
         os.makedirs(LOG_DIR, exist_ok=True)
+        os.makedirs(self.runtime_state_dir, exist_ok=True)
         self.event_log_path = os.path.join(self.base_dir, EVENT_LOG_FILE)
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
         self.raw_audio_backup_dir = os.path.join(self.base_dir, RAW_AUDIO_BACKUP_DIR)
@@ -1166,10 +1186,10 @@ class WhisperWidget(ctk.CTk):
         self.p = pyaudio.PyAudio()
         self.stream = None
         self.sound_lock = threading.Lock()
-        self.temp_filename = "temp_recording.wav"
-        self.temp_denoised_filename = "temp_denoised.wav"
-        self.temp_normalized_filename = "temp_normalized.wav"
-        self.temp_speech_filename = "temp_speech_only.wav"
+        self.temp_filename = os.path.join(self.base_dir, "temp_recording.wav")
+        self.temp_denoised_filename = os.path.join(self.base_dir, "temp_denoised.wav")
+        self.temp_normalized_filename = os.path.join(self.base_dir, "temp_normalized.wav")
+        self.temp_speech_filename = os.path.join(self.base_dir, "temp_speech_only.wav")
         self.current_raw_backup_path = None
         self.chunk_spooler = None
         self.chunk_capture_chunks = []
@@ -1178,6 +1198,8 @@ class WhisperWidget(ctk.CTk):
         self.chunk_transcribe_results = {}
         self.chunk_transcribe_lock = threading.Lock()
         self.chunk_pipeline_failed = False
+        self.startup_recovery_thread = None
+        self.recovery_state = {"active": False}
         self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
         self.whisper_worker_path = os.path.join(self.base_dir, "whisper_transcribe_worker.py")
         self.vad_client = PersistentVADWorkerClient(
@@ -1216,6 +1238,8 @@ class WhisperWidget(ctk.CTk):
         self.whisper_ready = False
         self.status_label = ctk.CTkLabel(self, text="Loading Model...", font=("Arial", 10))
         self.status_label.grid(row=1, column=0, pady=(0, 5))
+        self.update_ui_state("loading")
+        self.write_runtime_heartbeat(reason="app_initialized")
         
         threading.Thread(target=self.load_model, daemon=True).start()
 
@@ -1234,6 +1258,7 @@ class WhisperWidget(ctk.CTk):
         self.reassert_topmost()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.log_event("app_ready")
+        self.write_runtime_heartbeat(reason="app_ready")
 
     def start_drag(self, event):
         self.x = event.x
@@ -1258,6 +1283,168 @@ class WhisperWidget(ctk.CTk):
         if chunk_index is not None:
             fields["chunk_index"] = chunk_index
         self.log_event(f"chunk_{event}", **fields)
+
+    def build_runtime_heartbeat_payload(self, status=None, reason=None):
+        listener_alive = bool(self.hotkey_listener_thread and self.hotkey_listener_thread.is_alive())
+        payload = {
+            "pid": os.getpid(),
+            "session_id": self.runtime_session_id,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "status": status or self.last_ui_state or "starting",
+            "recording": bool(self.is_recording),
+            "processing": bool(self.is_processing),
+            "recovery_active": bool((self.recovery_state or {}).get("active")),
+            "hotkey_mode": self.hotkey_mode,
+            "hotkey_listener_alive": listener_alive,
+            "raw_backup_path": self.current_raw_backup_path,
+            "chunk_dir": self.chunked_temp_dir,
+            "chunk_dir_exists": os.path.isdir(self.chunked_temp_dir),
+        }
+        if reason:
+            payload["reason"] = reason
+        return payload
+
+    def write_runtime_heartbeat(self, status=None, reason=None):
+        try:
+            payload = self.build_runtime_heartbeat_payload(status=status, reason=reason)
+            with self.runtime_state_lock:
+                write_json_atomic(self.runtime_heartbeat_path, payload)
+        except Exception as e:
+            self.log_event("runtime_heartbeat_write_failed", error=e)
+
+    def remove_runtime_heartbeat(self):
+        try:
+            if os.path.exists(self.runtime_heartbeat_path):
+                os.remove(self.runtime_heartbeat_path)
+        except Exception as e:
+            self.log_event("runtime_heartbeat_remove_failed", error=e)
+
+    def update_recovery_state(self, **fields):
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = dict(self.recovery_state or {})
+        payload.update(fields)
+        payload.setdefault("active", True)
+        payload.setdefault("started_at", now)
+        payload["updated_at"] = now
+        payload["pid"] = os.getpid()
+        payload["session_id"] = self.runtime_session_id
+        if payload.get("mode") == "chunked":
+            payload["chunk_dir"] = self.chunked_temp_dir
+        if self.current_raw_backup_path and not payload.get("raw_backup_path"):
+            payload["raw_backup_path"] = self.current_raw_backup_path
+
+        with self.runtime_state_lock:
+            write_json_atomic(self.runtime_recovery_path, payload)
+        self.recovery_state = payload
+
+    def clear_recovery_state(self, reason="cleared"):
+        had_state = os.path.exists(self.runtime_recovery_path)
+        self.recovery_state = {"active": False}
+        try:
+            with self.runtime_state_lock:
+                if os.path.exists(self.runtime_recovery_path):
+                    os.remove(self.runtime_recovery_path)
+        except Exception as e:
+            self.log_event("recovery_state_clear_failed", reason=reason, error=e)
+            return
+
+        if had_state:
+            self.log_event("recovery_state_cleared", reason=reason)
+
+    def parse_chunk_recovery_entry(self, path):
+        match = re.match(r"^chunk_(\d{4})_(\d+)_(\d+)\.wav$", os.path.basename(path))
+        if not match:
+            return None
+
+        chunk_index = int(match.group(1))
+        start_sample = int(match.group(2))
+        end_sample = int(match.group(3))
+        sample_count = max(0, end_sample - start_sample)
+        return {
+            "index": chunk_index,
+            "path": path,
+            "start_sample": start_sample,
+            "end_sample": end_sample,
+            "seconds": sample_count / float(SAMPLE_RATE),
+            "is_final": False,
+        }
+
+    def load_startup_recovery_candidate(self):
+        if not os.path.exists(self.runtime_recovery_path):
+            return None
+
+        try:
+            with open(self.runtime_recovery_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as e:
+            self.log_event("startup_recovery_state_invalid", error=e)
+            self.clear_recovery_state(reason="invalid_startup_state")
+            return None
+
+        if not state.get("active"):
+            self.clear_recovery_state(reason="inactive_startup_state")
+            return None
+
+        chunk_dir = state.get("chunk_dir") or self.chunked_temp_dir
+        chunk_candidates = []
+        if chunk_dir and os.path.isdir(chunk_dir):
+            for entry in os.listdir(chunk_dir):
+                parsed = self.parse_chunk_recovery_entry(os.path.join(chunk_dir, entry))
+                if parsed is not None:
+                    chunk_candidates.append(parsed)
+
+        if chunk_candidates:
+            chunk_candidates.sort(key=lambda item: item["index"])
+            if chunk_candidates:
+                chunk_candidates[-1]["is_final"] = True
+            return {
+                "kind": "chunked",
+                "state": state,
+                "chunk_dir": chunk_dir,
+                "chunks": chunk_candidates,
+            }
+
+        raw_backup_path = state.get("raw_backup_path")
+        if raw_backup_path and os.path.exists(raw_backup_path):
+            return {
+                "kind": "raw_backup",
+                "state": state,
+                "raw_path": raw_backup_path,
+            }
+
+        if os.path.exists(self.temp_filename):
+            return {
+                "kind": "temp_recording",
+                "state": state,
+                "raw_path": self.temp_filename,
+            }
+
+        self.log_event(
+            "startup_recovery_stale_state",
+            mode=state.get("mode"),
+            chunk_dir=chunk_dir,
+            raw_backup_path=raw_backup_path,
+        )
+        self.clear_recovery_state(reason="stale_startup_state")
+        return None
+
+    def reset_temp_audio_files(self, include_raw=False, reason="reset"):
+        temp_paths = [
+            self.temp_denoised_filename,
+            self.temp_normalized_filename,
+            self.temp_speech_filename,
+        ]
+        if include_raw:
+            temp_paths.insert(0, self.temp_filename)
+
+        for path in temp_paths:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                os.remove(path)
+                self.log_event("temp_file_removed", file=path, reason=reason)
+            except Exception as e:
+                self.log_event("temp_file_remove_failed", file=path, reason=reason, error=e)
 
     def is_safe_child_path(self, path, parent_dir):
         try:
@@ -1319,6 +1506,12 @@ class WhisperWidget(ctk.CTk):
                 channels=CHANNELS,
                 sample_width=sample_width,
             )
+            self.update_recovery_state(
+                active=True,
+                mode="chunked",
+                stage="recording",
+                chunk_count=0,
+            )
         except Exception as e:
             self.chunk_spooler = None
             self.log_chunk_event("capture_start_failed", error=e)
@@ -1333,6 +1526,13 @@ class WhisperWidget(ctk.CTk):
                 self.chunk_capture_chunks.append(chunk)
                 if not self.enqueue_chunk_for_transcription(chunk):
                     self.chunk_pipeline_failed = True
+            if chunks:
+                self.update_recovery_state(
+                    active=True,
+                    mode="chunked",
+                    stage="recording",
+                    chunk_count=len(self.chunk_capture_chunks),
+                )
         except Exception as e:
             self.log_chunk_event("capture_frame_failed", error=e)
             self.chunk_spooler = None
@@ -1354,6 +1554,13 @@ class WhisperWidget(ctk.CTk):
                 "capture_finalized",
                 chunks=len(self.chunk_capture_chunks),
                 reason=reason,
+            )
+            self.update_recovery_state(
+                active=True,
+                mode="chunked",
+                stage="processing",
+                chunk_count=len(self.chunk_capture_chunks),
+                capture_finalize_reason=reason,
             )
             return list(self.chunk_capture_chunks)
         except Exception as e:
@@ -1955,7 +2162,9 @@ class WhisperWidget(ctk.CTk):
             except Exception as vad_error:
                 print(f"VAD worker prewarm failed: {vad_error}")
                 self.log_event("vad_worker_prewarm_failed", error=vad_error)
-            self.ui_call(self.update_ui_state, "ready")
+            recovery_candidate = self.load_startup_recovery_candidate()
+            if recovery_candidate is None:
+                self.ui_call(self.update_ui_state, "ready")
             print("Whisper worker ready.")
             self.log_event(
                 "model_load_success",
@@ -1964,12 +2173,121 @@ class WhisperWidget(ctk.CTk):
                 launcher_pid=ready_payload.get("launcher_pid"),
                 worker_pid=ready_payload.get("pid"),
             )
-            self.play_sound(1000, 100)
+            if recovery_candidate is None:
+                self.play_sound(1000, 100)
+            else:
+                self.log_event(
+                    "startup_recovery_candidate_found",
+                    kind=recovery_candidate.get("kind"),
+                    chunks=len(recovery_candidate.get("chunks") or []),
+                    raw_path=recovery_candidate.get("raw_path"),
+                )
+                self.ui_call(self.start_startup_recovery, recovery_candidate)
         except Exception as e:
             self.whisper_ready = False
             self.ui_call(self.status_label.configure, text="Error Loading")
             print(f"Error loading model: {e}")
             self.log_event("model_load_failed", error=e)
+
+    def start_startup_recovery(self, candidate):
+        if self.startup_recovery_thread is not None or self.is_processing:
+            return
+
+        self.is_recording = False
+        self.is_processing = True
+        self.update_ui_state("recovering")
+        self.write_runtime_heartbeat(reason="startup_recovery_start")
+        self.startup_recovery_thread = threading.Thread(
+            target=self.run_startup_recovery,
+            args=(candidate,),
+            daemon=True,
+            name="startup_recovery",
+        )
+        self.startup_recovery_thread.start()
+
+    def run_startup_recovery(self, candidate):
+        try:
+            kind = candidate.get("kind")
+            if kind == "chunked":
+                self.recover_chunked_session(candidate)
+            elif kind in ("raw_backup", "temp_recording"):
+                self.recover_single_session(candidate)
+            else:
+                raise RuntimeError(f"unsupported_recovery_kind={kind}")
+        except Exception as e:
+            self.log_event("startup_recovery_failed", kind=candidate.get("kind"), error=e)
+            self.clear_recovery_state(reason="startup_recovery_failed")
+            self.ui_call(self.finish_processing)
+        finally:
+            self.startup_recovery_thread = None
+
+    def recover_chunked_session(self, candidate):
+        chunk_results = []
+        chunk_list = list(candidate.get("chunks") or [])
+        self.log_event(
+            "startup_recovery_chunked_begin",
+            chunks=len(chunk_list),
+            chunk_dir=candidate.get("chunk_dir"),
+        )
+        try:
+            for chunk in chunk_list:
+                result = self.process_and_transcribe_chunk(chunk)
+                chunk_results.append(result)
+
+            failed_results = [result for result in chunk_results if not result.get("ok")]
+            if failed_results:
+                raise RuntimeError(f"chunk_recovery_failures={len(failed_results)}")
+
+            text = self.stitch_chunk_transcripts(chunk_results)
+            self.write_chunk_transcript_debug(chunk_results, text, reason="recovery_success")
+            if text:
+                print("\n[transcription]")
+                print(text)
+                print("[/transcription]", flush=True)
+                pyperclip.copy(text)
+                print("Copied transcription to clipboard.")
+                self.log_event(
+                    "chunked_transcription_success",
+                    chunks=len(chunk_results),
+                    chars=len(text),
+                    recovered=True,
+                )
+                self.log_transcription(text)
+                self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                self.play_sound_sequence([(1000, 100), (1500, 100)])
+                time.sleep(1)
+            else:
+                self.log_event("chunked_transcription_empty", chunks=len(chunk_results), recovered=True)
+
+            self.log_event(
+                "chunked_transcription_pipeline_finish",
+                success=True,
+                chunks=len(chunk_results),
+                chars=len(text),
+                recovered=True,
+            )
+            self.cleanup_chunked_temp_dir(
+                keep=CHUNKED_KEEP_TEMP_ON_SUCCESS,
+                reason="recovery_success",
+            )
+            self.clear_recovery_state(reason="startup_recovery_chunked_success")
+            self.ui_call(self.finish_processing)
+        except Exception:
+            self.write_chunk_transcript_debug(chunk_results, "", reason="recovery_failure")
+            self.cleanup_chunked_temp_dir(
+                keep=CHUNKED_KEEP_TEMP_ON_FAILURE,
+                reason="recovery_failure",
+            )
+            raise
+
+    def recover_single_session(self, candidate):
+        raw_path = candidate.get("raw_path")
+        if not raw_path or not os.path.exists(raw_path):
+            raise FileNotFoundError(f"Missing recovery audio: {raw_path}")
+
+        self.log_event("startup_recovery_single_begin", file=raw_path, kind=candidate.get("kind"))
+        self.claim_raw_audio_backup(raw_path)
+        self.transcribe_saved_audio(raw_path, source_label=f"startup_recovery_{candidate.get('kind')}")
 
     def is_whisper_ready(self):
         return self.whisper_client.is_ready()
@@ -2048,6 +2366,7 @@ class WhisperWidget(ctk.CTk):
             recording=self.is_recording,
             processing=self.is_processing
         )
+        self.write_runtime_heartbeat(reason="periodic_heartbeat")
         self.after(10000, self.maintain_topmost)
 
     def on_hotkey_pressed(self):
@@ -2294,17 +2613,46 @@ class WhisperWidget(ctk.CTk):
         except Exception as e:
             self.log_event("debug_audio_capture_failed", error=e)
 
-    def save_raw_audio_backup(self):
+    def create_raw_audio_backup(self, source_path):
         capture_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         backup_path = os.path.join(self.raw_audio_backup_dir, f"recording_{capture_id}.wav")
         self.current_raw_backup_path = None
 
         try:
-            shutil.copy2(self.temp_filename, backup_path)
+            shutil.copy2(source_path, backup_path)
             self.current_raw_backup_path = backup_path
-            self.log_event("raw_audio_backup_saved", file=backup_path)
+            self.log_event("raw_audio_backup_saved", file=backup_path, source=source_path)
+            self.update_recovery_state(
+                active=True,
+                mode="single",
+                stage="raw_backup_saved",
+                raw_backup_path=backup_path,
+            )
+            return backup_path
         except Exception as e:
-            self.log_event("raw_audio_backup_failed", error=e)
+            self.log_event("raw_audio_backup_failed", source=source_path, error=e)
+            return None
+
+    def save_raw_audio_backup(self):
+        return self.create_raw_audio_backup(self.temp_filename)
+
+    def claim_raw_audio_backup(self, source_path):
+        source_path = os.path.abspath(source_path)
+        raw_backup_root = os.path.abspath(self.raw_audio_backup_dir)
+        try:
+            if os.path.commonpath([source_path, raw_backup_root]) == raw_backup_root:
+                self.current_raw_backup_path = source_path
+                self.update_recovery_state(
+                    active=True,
+                    mode="single",
+                    stage="raw_backup_claimed",
+                    raw_backup_path=source_path,
+                )
+                return source_path
+        except Exception:
+            pass
+
+        return self.create_raw_audio_backup(source_path)
 
     def remove_raw_audio_backup(self):
         backup_path = self.current_raw_backup_path
@@ -2363,6 +2711,10 @@ class WhisperWidget(ctk.CTk):
         elif state == "processing":
             self.record_btn.configure(text="...", fg_color="#f9a825", state="disabled")
             self.status_label.configure(text="Transcribing...")
+        elif state == "recovering":
+            self.record_btn.configure(text="RETRY", fg_color="#ef6c00", state="disabled")
+            self.status_label.configure(text="Recovering...")
+        self.write_runtime_heartbeat(reason="ui_state_changed")
 
     def toggle_recording(self):
         """Main toggle logic."""
@@ -2384,7 +2736,15 @@ class WhisperWidget(ctk.CTk):
 
     def start_recording(self):
         self.is_recording = True
+        self.is_processing = False
         self.audio_frames = []
+        self.reset_temp_audio_files(include_raw=True, reason="recording_start")
+        self.update_recovery_state(
+            active=True,
+            mode="chunked" if CHUNKED_TRANSCRIPTION_ENABLED else "single",
+            stage="recording",
+            raw_backup_path=None,
+        )
         self.start_chunk_capture()
         self.update_ui_state("recording")
         self.log_event("recording_started")
@@ -2405,6 +2765,7 @@ class WhisperWidget(ctk.CTk):
             print(f"Microphone error: {e}")
             self.log_event("microphone_error", error=e)
             self.is_recording = False
+            self.clear_recovery_state(reason="microphone_error")
             self.update_ui_state("ready")
 
     def record_loop(self):
@@ -2434,6 +2795,13 @@ class WhisperWidget(ctk.CTk):
 
         self.update_ui_state("processing")
         self.is_processing = True
+        self.write_runtime_heartbeat(reason="stop_recording")
+        self.update_recovery_state(
+            active=True,
+            mode="chunked" if CHUNKED_TRANSCRIPTION_ENABLED else "single",
+            stage="processing",
+            chunk_count=len(self.chunk_capture_chunks),
+        )
         self.log_event("transcription_pipeline_start")
 
         # Save and Transcribe in Background
@@ -2489,6 +2857,7 @@ class WhisperWidget(ctk.CTk):
                 keep=CHUNKED_KEEP_TEMP_ON_SUCCESS,
                 reason="success",
             )
+            self.clear_recovery_state(reason="chunked_transcription_success")
             self.ui_call(self.finish_processing)
         except Exception as e:
             self.log_event("chunked_transcription_failed_fallback_batch", error=e)
@@ -2520,15 +2889,21 @@ class WhisperWidget(ctk.CTk):
             )
             if worker_active:
                 self.log_event("chunked_transcription_fallback_skipped_worker_active")
+                self.clear_recovery_state(reason="chunked_fallback_skipped_worker_active")
                 self.ui_call(self.finish_processing)
                 return
 
+            self.update_recovery_state(
+                active=True,
+                mode="single",
+                stage="fallback_batch_transcription",
+            )
             self.transcribe_audio()
 
     def transcribe_audio(self):
         self.log_event("transcribe_thread_started")
-        # Save to WAV
         try:
+            self.reset_temp_audio_files(include_raw=False, reason="transcribe_audio_start")
             wf = wave.open(self.temp_filename, 'wb')
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
@@ -2540,10 +2915,48 @@ class WhisperWidget(ctk.CTk):
         except Exception as e:
             print(f"Error saving WAV: {e}")
             self.log_event("audio_save_failed", error=e)
+            self.clear_recovery_state(reason="audio_save_failed")
             self.ui_call(self.finish_processing)
             return
 
-        # -------- VAD FIRST (CPU) --------
+        self.transcribe_saved_audio(self.temp_filename, source_label="live_recording")
+
+    def transcribe_saved_audio(self, raw_source_path, source_label="saved_audio"):
+        raw_source_path = os.path.abspath(raw_source_path)
+        active_input_path = os.path.abspath(self.temp_filename)
+
+        try:
+            self.reset_temp_audio_files(
+                include_raw=(raw_source_path != active_input_path),
+                reason="transcribe_saved_audio_start",
+            )
+            if raw_source_path != active_input_path:
+                shutil.copy2(raw_source_path, self.temp_filename)
+                self.log_event(
+                    "transcribe_source_staged",
+                    source=raw_source_path,
+                    staged_file=self.temp_filename,
+                    source_label=source_label,
+                )
+        except Exception as e:
+            self.log_event(
+                "transcribe_source_stage_failed",
+                source=raw_source_path,
+                source_label=source_label,
+                error=e,
+            )
+            self.clear_recovery_state(reason="transcribe_source_stage_failed")
+            self.ui_call(self.finish_processing)
+            return
+
+        self.update_recovery_state(
+            active=True,
+            mode="single",
+            stage="processing_saved_audio",
+            source_label=source_label,
+            raw_backup_path=self.current_raw_backup_path,
+        )
+
         speech_secs = 0.0
         processed_source = None
         self.log_event("vad_start", file=self.temp_filename)
@@ -2727,7 +3140,6 @@ class WhisperWidget(ctk.CTk):
         self.log_event("transcription_pipeline_finish", success=success)
         self.ui_call(self.finish_processing)
 
-        # Cleanup Logic
         if success:
             self.remove_raw_audio_backup()
             for f in [
@@ -2743,13 +3155,12 @@ class WhisperWidget(ctk.CTk):
                     except:
                         self.log_event("temp_file_remove_failed", file=f)
                         pass
+            self.clear_recovery_state(reason="transcription_pipeline_complete")
         else:
-            # Failure: Keep the pre-VAD backup if it was captured.
             raw_backup_preserved = self.preserve_raw_audio_backup()
 
-            # Failure: Save the file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            failed_filename = f"failed_recording_{timestamp}.wav"
+            failed_filename = os.path.join(self.base_dir, f"failed_recording_{timestamp}.wav")
             if not raw_backup_preserved:
                 try:
                     os.rename(self.temp_filename, failed_filename)
@@ -2761,7 +3172,7 @@ class WhisperWidget(ctk.CTk):
 
             if os.path.exists(self.temp_denoised_filename):
                 try:
-                    failed_denoised_filename = f"failed_denoised_{timestamp}.wav"
+                    failed_denoised_filename = os.path.join(self.base_dir, f"failed_denoised_{timestamp}.wav")
                     os.rename(self.temp_denoised_filename, failed_denoised_filename)
                     self.log_event("transcription_failed_denoised_saved", file=failed_denoised_filename)
                 except:
@@ -2770,7 +3181,7 @@ class WhisperWidget(ctk.CTk):
 
             if os.path.exists(self.temp_normalized_filename):
                 try:
-                    failed_normalized_filename = f"failed_normalized_{timestamp}.wav"
+                    failed_normalized_filename = os.path.join(self.base_dir, f"failed_normalized_{timestamp}.wav")
                     os.rename(self.temp_normalized_filename, failed_normalized_filename)
                     self.log_event("transcription_failed_normalized_saved", file=failed_normalized_filename)
                 except:
@@ -2779,20 +3190,31 @@ class WhisperWidget(ctk.CTk):
 
             if os.path.exists(self.temp_speech_filename):
                 try:
-                    failed_speech_filename = f"failed_speech_only_{timestamp}.wav"
+                    failed_speech_filename = os.path.join(self.base_dir, f"failed_speech_only_{timestamp}.wav")
                     os.rename(self.temp_speech_filename, failed_speech_filename)
                     self.log_event("transcription_failed_speech_saved", file=failed_speech_filename)
                 except:
                     self.log_event("transcription_failed_speech_save_failed")
                     pass
+            self.clear_recovery_state(reason="transcription_pipeline_complete")
 
     def finish_processing(self):
         self.is_processing = False
         self.update_ui_state("ready")
         self.log_event("processing_finished")
+        self.write_runtime_heartbeat(reason="processing_finished")
 
     def on_close(self):
         self.log_event("app_close_start")
+        if not self.is_recording and not self.is_processing:
+            self.clear_recovery_state(reason="clean_shutdown")
+        else:
+            self.log_event(
+                "app_close_preserving_recovery_state",
+                recording=self.is_recording,
+                processing=self.is_processing,
+            )
+        self.write_runtime_heartbeat(status="stopping", reason="app_close_start")
         self.shutdown_event.set()
         self.unregister_hotkey()
         self.whisper_client.close()
@@ -2808,6 +3230,7 @@ class WhisperWidget(ctk.CTk):
             print(f"Audio cleanup failed: {e}")
             self.log_event("audio_shutdown_failed", error=e)
         self.log_event("app_close_end")
+        self.remove_runtime_heartbeat()
         self.destroy()
 
 if __name__ == "__main__":
