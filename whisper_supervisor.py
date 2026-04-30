@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import time
+import ctypes
 from datetime import datetime
 
 
@@ -18,6 +19,63 @@ CRASH_WINDOW_SECONDS = 600.0
 MAX_CRASHES_IN_WINDOW = 6
 BASE_BACKOFF_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 30.0
+
+if os.name == "nt":
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    SYNCHRONIZE = 0x00100000
+    STILL_ACTIVE = 259
+    WAIT_TIMEOUT = 0x00000102
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    _kernel32.OpenProcess.restype = ctypes.c_void_p
+    _kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    _kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    _kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _kernel32.CloseHandle.restype = ctypes.c_int
+
+
+class RuntimeProcess:
+    def __init__(self, pid: int):
+        self.pid = int(pid)
+        self.handle = None
+
+        if os.name != "nt":
+            return
+
+        desired_access = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+        handle = _kernel32.OpenProcess(desired_access, False, self.pid)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), f"OpenProcess failed for pid={self.pid}")
+        self.handle = handle
+
+    def poll(self):
+        if os.name != "nt":
+            try:
+                os.kill(self.pid, 0)
+                return None
+            except OSError:
+                return 1
+
+        if not self.handle:
+            return None
+
+        wait_result = _kernel32.WaitForSingleObject(self.handle, 0)
+        if wait_result == WAIT_TIMEOUT:
+            return None
+
+        exit_code = ctypes.c_uint32()
+        if not _kernel32.GetExitCodeProcess(self.handle, ctypes.byref(exit_code)):
+            raise OSError(ctypes.get_last_error(), f"GetExitCodeProcess failed for pid={self.pid}")
+        if exit_code.value == STILL_ACTIVE:
+            return None
+        return int(exit_code.value)
+
+    def close(self):
+        if self.handle:
+            _kernel32.CloseHandle(self.handle)
+            self.handle = None
 
 
 def log(message: str, **fields):
@@ -108,6 +166,30 @@ def stop_child(child: subprocess.Popen, reason: str, force: bool):
     return child.poll()
 
 
+def stop_runtime_process(runtime_process: RuntimeProcess | None, reason: str, force: bool):
+    if runtime_process is None:
+        return None
+
+    returncode = runtime_process.poll()
+    if returncode is not None:
+        return returncode
+
+    log("runtime_stop_requested", pid=runtime_process.pid, reason=reason, force=force)
+    try:
+        kill_process_tree(runtime_process.pid, force=force)
+    except Exception as exc:
+        log("runtime_force_kill_failed", pid=runtime_process.pid, reason=reason, error=exc)
+        return runtime_process.poll()
+
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        returncode = runtime_process.poll()
+        if returncode is not None:
+            return returncode
+        time.sleep(0.25)
+    return runtime_process.poll()
+
+
 def launch_child():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -131,15 +213,19 @@ def restart_delay(crashes_in_window: int):
 def main():
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     crash_times = []
+    log("supervisor_started", pid=os.getpid(), python=sys.executable, script=CHILD_SCRIPT)
 
     while True:
         remove_file(HEARTBEAT_PATH)
         child = launch_child()
+        runtime_process = None
+        runtime_attach_failed_pid = None
         launch_time = time.monotonic()
         launch_wall_time = time.time()
         bound_session_id = None
         restart_reason = None
         restart_details = {}
+        launcher_exit_logged = False
 
         try:
             while True:
@@ -152,14 +238,66 @@ def main():
                         heartbeat_pid=heartbeat.get("pid"),
                         session_id=bound_session_id,
                     )
+                if heartbeat is not None and runtime_process is None:
+                    heartbeat_pid = heartbeat.get("pid")
+                    if heartbeat_pid not in (None, child.pid):
+                        try:
+                            runtime_process = RuntimeProcess(heartbeat_pid)
+                            runtime_attach_failed_pid = None
+                            log(
+                                "child_runtime_attached",
+                                launcher_pid=child.pid,
+                                runtime_pid=runtime_process.pid,
+                                session_id=bound_session_id,
+                            )
+                        except Exception as exc:
+                            if runtime_attach_failed_pid != heartbeat_pid:
+                                log(
+                                    "child_runtime_attach_failed",
+                                    launcher_pid=child.pid,
+                                    runtime_pid=heartbeat_pid,
+                                    session_id=bound_session_id,
+                                    error=exc,
+                                )
+                                runtime_attach_failed_pid = heartbeat_pid
 
-                returncode = child.poll()
+                launcher_returncode = child.poll()
+                if runtime_process is not None and launcher_returncode is not None and not launcher_exit_logged:
+                    log(
+                        "child_launcher_exited",
+                        launcher_pid=child.pid,
+                        runtime_pid=runtime_process.pid,
+                        returncode=launcher_returncode,
+                    )
+                    launcher_exit_logged = True
+
+                monitored_process = runtime_process or child
+                monitored_pid = runtime_process.pid if runtime_process is not None else child.pid
+                returncode = monitored_process.poll()
                 if returncode is not None:
                     if returncode == 0:
-                        log("child_exited_cleanly", pid=child.pid, returncode=returncode)
+                        detached_runtime_pid = heartbeat.get("pid") if heartbeat is not None else None
+                        detached_runtime_pending = detached_runtime_pid not in (None, child.pid) and runtime_process is None
+                        if runtime_process is None and (bound_session_id is None or detached_runtime_pending):
+                            elapsed = time.monotonic() - launch_time
+                            if elapsed <= STARTUP_GRACE_SECONDS:
+                                if not launcher_exit_logged:
+                                    log(
+                                        "child_launcher_exited_awaiting_heartbeat",
+                                        launcher_pid=child.pid,
+                                        heartbeat_pid=detached_runtime_pid,
+                                        returncode=returncode,
+                                        elapsed_seconds=f"{elapsed:.1f}",
+                                    )
+                                    launcher_exit_logged = True
+                                time.sleep(POLL_INTERVAL_SECONDS)
+                                continue
+                        log("child_exited_cleanly", pid=monitored_pid, returncode=returncode)
+                        if runtime_process is not None:
+                            runtime_process.close()
                         return 0
                     restart_reason = "child_exit"
-                    restart_details = {"returncode": returncode}
+                    restart_details = {"returncode": returncode, "monitored_pid": monitored_pid}
                     break
 
                 elapsed = time.monotonic() - launch_time
@@ -184,26 +322,33 @@ def main():
                 time.sleep(POLL_INTERVAL_SECONDS)
         except KeyboardInterrupt:
             log("supervisor_interrupt", pid=child.pid)
+            stop_runtime_process(runtime_process, reason="supervisor_interrupt", force=False)
             stop_child(child, reason="supervisor_interrupt", force=False)
+            if runtime_process is not None:
+                runtime_process.close()
             return 130
 
         if restart_reason in ("heartbeat_missing", "heartbeat_stale"):
+            stop_runtime_process(runtime_process, reason=restart_reason, force=True)
             stop_child(child, reason=restart_reason, force=True)
 
         now = time.monotonic()
         crash_times = [timestamp for timestamp in crash_times if now - timestamp <= CRASH_WINDOW_SECONDS]
         crash_times.append(now)
         crashes_in_window = len(crash_times)
-        returncode = child.poll()
+        returncode = runtime_process.poll() if runtime_process is not None else child.poll()
 
         log(
             "child_restart_scheduled",
-            pid=child.pid,
+            pid=runtime_process.pid if runtime_process is not None else child.pid,
             reason=restart_reason,
             returncode=returncode,
             crashes_in_window=crashes_in_window,
             **restart_details,
         )
+
+        if runtime_process is not None:
+            runtime_process.close()
 
         if crashes_in_window > MAX_CRASHES_IN_WINDOW:
             log(
