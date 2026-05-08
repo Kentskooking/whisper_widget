@@ -15,14 +15,15 @@ import pyperclip
 import math
 import struct
 import warnings
+import faulthandler
 from queue import Queue, Empty, Full
 from ctypes import wintypes
 from datetime import datetime
-import soundfile as sf
+
 try:
-    import noisereduce as nr
+    import winsound
 except Exception:
-    nr = None
+    winsound = None
 
 try:
     import keyboard
@@ -82,6 +83,7 @@ CHUNKED_WHISPER_MAX_ATTEMPTS = 2
 RUNTIME_STATE_DIR = os.path.join("sidecache", "runtime")
 WIDGET_HEARTBEAT_FILE = "widget_heartbeat.json"
 WIDGET_RECOVERY_FILE = "widget_recovery.json"
+FATAL_PYTHON_LOG_FILE = "python_fatal.log"
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -135,6 +137,25 @@ if IS_WINDOWS:
 else:
     user32 = None
     kernel32 = None
+
+
+_fatal_log_file = None
+
+
+def enable_fatal_crash_logging():
+    global _fatal_log_file
+
+    try:
+        runtime_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), RUNTIME_STATE_DIR)
+        os.makedirs(runtime_dir, exist_ok=True)
+        crash_log_path = os.path.join(runtime_dir, FATAL_PYTHON_LOG_FILE)
+        _fatal_log_file = open(crash_log_path, "a", encoding="utf-8", buffering=1)
+        _fatal_log_file.write(
+            f"\n{datetime.now().isoformat(timespec='seconds')} | fatal_logging_enabled | pid={os.getpid()}\n"
+        )
+        faulthandler.enable(file=_fatal_log_file, all_threads=True)
+    except Exception:
+        _fatal_log_file = None
 
 
 def hotkey_token_to_vk(token: str):
@@ -206,11 +227,31 @@ def parse_hotkey_for_win32(hotkey: str):
 def write_json_atomic(path: str, payload):
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(temp_path, path)
+    temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    last_error = None
+
+    for attempt in range(6):
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(temp_path, path)
+            return
+        except OSError as e:
+            last_error = e
+            winerror = getattr(e, "winerror", None)
+            if winerror not in (5, 32):
+                break
+            time.sleep(min(0.5, 0.05 * (2 ** attempt)))
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+    if last_error is not None:
+        raise last_error
 
 
 class EventLogger:
@@ -836,8 +877,11 @@ def reduce_noise_wav(
     n_fft: int = 512,
 ):
     """Writes a denoised mono WAV for Whisper preprocessing."""
-    if nr is None:
-        raise RuntimeError("noisereduce is not installed")
+    try:
+        import noisereduce as nr
+        import soundfile as sf
+    except Exception as exc:
+        raise RuntimeError("noisereduce or soundfile is not installed") from exc
 
     audio, sample_rate = sf.read(in_wav_path, dtype="float32")
     if getattr(audio, "ndim", 1) > 1:
@@ -1185,6 +1229,8 @@ class WhisperWidget(ctk.CTk):
         self.hotkey_ready_event = threading.Event()
         self.p = pyaudio.PyAudio()
         self.stream = None
+        self.stream_lock = threading.Lock()
+        self.record_thread = None
         self.sound_lock = threading.Lock()
         self.temp_filename = os.path.join(self.base_dir, "temp_recording.wav")
         self.temp_denoised_filename = os.path.join(self.base_dir, "temp_denoised.wav")
@@ -1671,8 +1717,6 @@ class WhisperWidget(ctk.CTk):
                         processing_seconds=f"{denoise_seconds:.3f}",
                     )
                 elif noise_backend == "noisereduce_subprocess":
-                    if nr is None:
-                        raise RuntimeError("noisereduce is not installed")
                     worker_result = reduce_noise_wav_subprocess(
                         self.noise_reduce_worker_script,
                         processed_source,
@@ -2521,6 +2565,11 @@ class WhisperWidget(ctk.CTk):
     def _play_sound_sequence_sync(self, tones):
         try:
             with self.sound_lock:
+                if IS_WINDOWS and winsound is not None:
+                    for freq, duration in tones:
+                        winsound.Beep(int(freq), int(duration))
+                    return
+
                 for freq, duration in tones:
                     duration_ms = duration
                     rate = 44100
@@ -2769,7 +2818,12 @@ class WhisperWidget(ctk.CTk):
                 frames_per_buffer=CHUNK_SIZE
             )
             self.log_event("microphone_stream_opened", sample_rate=SAMPLE_RATE, chunk_size=CHUNK_SIZE)
-            threading.Thread(target=self.record_loop, daemon=True).start()
+            self.record_thread = threading.Thread(
+                target=self.record_loop,
+                daemon=True,
+                name="record_loop",
+            )
+            self.record_thread.start()
             self.play_sound(800, 100) # High Beep
         except Exception as e:
             print(f"Microphone error: {e}")
@@ -2781,7 +2835,11 @@ class WhisperWidget(ctk.CTk):
     def record_loop(self):
         while self.is_recording:
             try:
-                data = self.stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                with self.stream_lock:
+                    stream = self.stream
+                    if stream is None:
+                        break
+                    data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 self.audio_frames.append(data)
                 self.record_chunk_frame(data)
             except Exception as e:
@@ -2795,10 +2853,26 @@ class WhisperWidget(ctk.CTk):
         self.is_recording = False
         self.log_event("recording_stopped", frames=len(self.audio_frames))
 
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
+        record_thread = self.record_thread
+        if record_thread is not None and record_thread is not threading.current_thread():
+            record_thread.join(timeout=2.0)
+            if record_thread.is_alive():
+                self.log_event("record_thread_join_timeout")
+            else:
+                self.record_thread = None
+
+        acquired_stream_lock = self.stream_lock.acquire(timeout=2.0)
+        if not acquired_stream_lock:
+            self.log_event("microphone_stream_close_skipped", reason="stream_lock_timeout")
+        else:
+            try:
+                if self.stream:
+                    self.stream.stop_stream()
+                    self.stream.close()
+                    self.stream = None
+                    self.log_event("microphone_stream_closed")
+            finally:
+                self.stream_lock.release()
         self.finalize_chunk_capture()
 
         self.play_sound(400, 100) # Low Beep
@@ -3021,9 +3095,6 @@ class WhisperWidget(ctk.CTk):
                             processing_seconds=worker_result.get("elapsed_seconds"),
                         )
                     elif noise_backend == "noisereduce_subprocess":
-                        if nr is None:
-                            raise RuntimeError("noisereduce is not installed")
-
                         worker_result = reduce_noise_wav_subprocess(
                             self.noise_reduce_worker_script,
                             processed_source,
@@ -3244,5 +3315,6 @@ class WhisperWidget(ctk.CTk):
         self.destroy()
 
 if __name__ == "__main__":
+    enable_fatal_crash_logging()
     app = WhisperWidget()
     app.mainloop()

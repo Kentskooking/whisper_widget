@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 import ctypes
+import traceback
 from datetime import datetime
 
 
@@ -89,9 +90,12 @@ def log(message: str, **fields):
     if details:
         line += f" | {details}"
     print(line, flush=True)
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    with open(SUPERVISOR_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    try:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(SUPERVISOR_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as exc:
+        print(f"{timestamp} | supervisor_log_write_failed | error={exc}", flush=True)
 
 
 def load_json(path: str):
@@ -170,7 +174,11 @@ def stop_runtime_process(runtime_process: RuntimeProcess | None, reason: str, fo
     if runtime_process is None:
         return None
 
-    returncode = runtime_process.poll()
+    try:
+        returncode = runtime_process.poll()
+    except Exception as exc:
+        log("runtime_poll_failed", pid=runtime_process.pid, reason=reason, error=exc)
+        returncode = None
     if returncode is not None:
         return returncode
 
@@ -183,11 +191,30 @@ def stop_runtime_process(runtime_process: RuntimeProcess | None, reason: str, fo
 
     deadline = time.time() + 15.0
     while time.time() < deadline:
-        returncode = runtime_process.poll()
+        try:
+            returncode = runtime_process.poll()
+        except Exception as exc:
+            log("runtime_poll_failed", pid=runtime_process.pid, reason=reason, error=exc)
+            return None
         if returncode is not None:
             return returncode
         time.sleep(0.25)
-    return runtime_process.poll()
+    try:
+        return runtime_process.poll()
+    except Exception as exc:
+        log("runtime_poll_failed", pid=runtime_process.pid, reason=reason, error=exc)
+        return None
+
+
+def safe_poll(process, description: str):
+    if process is None:
+        return None
+
+    try:
+        return process.poll()
+    except Exception as exc:
+        log("process_poll_failed", process=description, error=exc)
+        return None
 
 
 def launch_child():
@@ -320,6 +347,13 @@ def main():
                         break
 
                 time.sleep(POLL_INTERVAL_SECONDS)
+        except Exception as exc:
+            restart_reason = "supervisor_monitor_error"
+            restart_details = {
+                "error": repr(exc),
+                "traceback": traceback.format_exc()[-1200:],
+            }
+            log("supervisor_monitor_error", **restart_details)
         except KeyboardInterrupt:
             log("supervisor_interrupt", pid=child.pid)
             stop_runtime_process(runtime_process, reason="supervisor_interrupt", force=False)
@@ -328,7 +362,7 @@ def main():
                 runtime_process.close()
             return 130
 
-        if restart_reason in ("heartbeat_missing", "heartbeat_stale"):
+        if restart_reason in ("heartbeat_missing", "heartbeat_stale", "supervisor_monitor_error"):
             stop_runtime_process(runtime_process, reason=restart_reason, force=True)
             stop_child(child, reason=restart_reason, force=True)
 
@@ -336,7 +370,11 @@ def main():
         crash_times = [timestamp for timestamp in crash_times if now - timestamp <= CRASH_WINDOW_SECONDS]
         crash_times.append(now)
         crashes_in_window = len(crash_times)
-        returncode = runtime_process.poll() if runtime_process is not None else child.poll()
+        returncode = (
+            safe_poll(runtime_process, "runtime")
+            if runtime_process is not None
+            else safe_poll(child, "child")
+        )
 
         log(
             "child_restart_scheduled",
