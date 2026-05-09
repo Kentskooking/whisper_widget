@@ -14,6 +14,7 @@ import re
 import pyperclip
 import math
 import struct
+import io
 import warnings
 import faulthandler
 from queue import Queue, Empty, Full
@@ -84,6 +85,14 @@ RUNTIME_STATE_DIR = os.path.join("sidecache", "runtime")
 WIDGET_HEARTBEAT_FILE = "widget_heartbeat.json"
 WIDGET_RECOVERY_FILE = "widget_recovery.json"
 FATAL_PYTHON_LOG_FILE = "python_fatal.log"
+SOUND_CUE_TONES = {
+    "notification": [(660, 80)],
+    "ready": [(880, 80)],
+    "unmute": [(880, 60)],
+    "record_start": [(660, 80)],
+    "record_stop": [(440, 80)],
+    "success": [(660, 80), (880, 80)],
+}
 
 # Win32 constants for stable global hotkey + topmost behavior
 IS_WINDOWS = os.name == "nt"
@@ -2228,7 +2237,7 @@ class WhisperWidget(ctk.CTk):
                 worker_pid=ready_payload.get("pid"),
             )
             if recovery_candidate is None:
-                self.play_sound(1000, 100)
+                self.play_cue("ready")
             else:
                 self.log_event(
                     "startup_recovery_candidate_found",
@@ -2308,7 +2317,7 @@ class WhisperWidget(ctk.CTk):
                 )
                 self.log_transcription(text)
                 self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
-                self.play_sound_sequence([(1000, 100), (1500, 100)])
+                self.play_cue("success")
                 time.sleep(1)
             else:
                 self.log_event("chunked_transcription_empty", chunks=len(chunk_results), recovered=True)
@@ -2548,8 +2557,22 @@ class WhisperWidget(ctk.CTk):
         self.hotkey_mode = None
         self.log_event("hotkey_unregistered", mode="win32_or_none")
 
+    def play_cue(self, cue_name: str = "notification"):
+        """Queues a non-blocking notification cue."""
+        if self.is_muted:
+            return
+
+        threading.Thread(
+            target=self._play_cue_sync,
+            args=(cue_name,),
+            daemon=True,
+        ).start()
+
     def play_sound(self, freq, duration):
         """Queues a non-blocking notification tone."""
+        if IS_WINDOWS and winsound is not None:
+            self.play_cue("notification")
+            return
         self.play_sound_sequence([(freq, duration)])
 
     def play_sound_sequence(self, tones):
@@ -2562,39 +2585,86 @@ class WhisperWidget(ctk.CTk):
             daemon=True
         ).start()
 
-    def _play_sound_sequence_sync(self, tones):
+    def _play_cue_sync(self, cue_name: str):
         try:
             with self.sound_lock:
-                if IS_WINDOWS and winsound is not None:
-                    for freq, duration in tones:
-                        winsound.Beep(int(freq), int(duration))
+                tones = SOUND_CUE_TONES.get(cue_name, SOUND_CUE_TONES["notification"])
+                if self._play_windows_generated_cue(tones):
                     return
 
-                for freq, duration in tones:
-                    duration_ms = duration
-                    rate = 44100
-
-                    num_samples = int(rate * (duration_ms / 1000.0))
-                    audio_data = []
-                    for x in range(num_samples):
-                        sample = 0.38 * math.sin(2 * math.pi * freq * (x / rate))
-                        packed_sample = struct.pack('<h', int(sample * 32767.0))
-                        audio_data.append(packed_sample)
-
-                    byte_stream = b''.join(audio_data)
-
-                    stream = self.p.open(
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=rate,
-                        output=True
-                    )
-                    stream.write(byte_stream)
-                    stream.stop_stream()
-                    stream.close()
+                self._play_generated_tones(tones)
         except Exception as e:
             print(f"Sound Error: {e}")
             self.log_event("sound_error", error=e)
+
+    def _play_windows_generated_cue(self, tones) -> bool:
+        if not (IS_WINDOWS and winsound is not None):
+            return False
+
+        try:
+            wav_bytes = self._build_cue_wav_bytes(tones)
+            winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_SYNC)
+            return True
+        except Exception as e:
+            self.log_event("windows_generated_cue_failed", error=e)
+            return False
+
+    def _play_sound_sequence_sync(self, tones):
+        try:
+            with self.sound_lock:
+                self._play_generated_tones(tones)
+        except Exception as e:
+            print(f"Sound Error: {e}")
+            self.log_event("sound_error", error=e)
+
+    def _play_generated_tones(self, tones):
+        rate = 44100
+
+        for freq, duration in tones:
+            byte_stream = self._build_tone_pcm_bytes(freq, duration, rate)
+
+            stream = self.p.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=rate,
+                output=True,
+            )
+            try:
+                stream.write(byte_stream)
+            finally:
+                stream.stop_stream()
+                stream.close()
+
+    def _build_cue_wav_bytes(self, tones):
+        rate = 44100
+        cue_buffer = io.BytesIO()
+        with wave.open(cue_buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(rate)
+            for index, (freq, duration) in enumerate(tones):
+                if index > 0:
+                    wav_file.writeframes(b"\x00\x00" * int(rate * 0.03))
+                wav_file.writeframes(self._build_tone_pcm_bytes(freq, duration, rate))
+        return cue_buffer.getvalue()
+
+    @staticmethod
+    def _build_tone_pcm_bytes(freq, duration_ms, rate):
+        duration_ms = int(duration_ms)
+        num_samples = int(rate * (duration_ms / 1000.0))
+        ramp_samples = max(1, min(num_samples // 2, int(rate * 0.008)))
+        audio_data = []
+
+        for x in range(num_samples):
+            envelope = min(
+                1.0,
+                x / ramp_samples,
+                (num_samples - x - 1) / ramp_samples,
+            )
+            sample = 0.16 * envelope * math.sin(2 * math.pi * float(freq) * (x / rate))
+            audio_data.append(struct.pack('<h', int(sample * 32767.0)))
+
+        return b''.join(audio_data)
 
     def build_transcribe_attempts(self, speech_secs, processed_source):
         base_options = self.base_transcribe_options()
@@ -2751,7 +2821,7 @@ class WhisperWidget(ctk.CTk):
             self.mute_label.configure(text="🔇")
         else:
             self.mute_label.configure(text="")
-            self.play_sound(1000, 50)
+            self.play_cue("unmute")
 
     def update_ui_state(self, state):
         """Updates button color and text based on state."""
@@ -2824,7 +2894,7 @@ class WhisperWidget(ctk.CTk):
                 name="record_loop",
             )
             self.record_thread.start()
-            self.play_sound(800, 100) # High Beep
+            self.play_cue("record_start")
         except Exception as e:
             print(f"Microphone error: {e}")
             self.log_event("microphone_error", error=e)
@@ -2875,7 +2945,7 @@ class WhisperWidget(ctk.CTk):
                 self.stream_lock.release()
         self.finalize_chunk_capture()
 
-        self.play_sound(400, 100) # Low Beep
+        self.play_cue("record_stop")
 
         self.update_ui_state("processing")
         self.is_processing = True
@@ -2926,7 +2996,7 @@ class WhisperWidget(ctk.CTk):
                 )
                 self.log_transcription(text)
                 self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
-                self.play_sound_sequence([(1000, 100), (1500, 100)])
+                self.play_cue("success")
                 time.sleep(1)
             else:
                 self.log_event("chunked_transcription_empty", chunks=len(chunk_results))
@@ -3193,7 +3263,7 @@ class WhisperWidget(ctk.CTk):
                     self.log_transcription(text)
 
                     self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
-                    self.play_sound_sequence([(1000, 100), (1500, 100)])
+                    self.play_cue("success")
                     time.sleep(1)
                     success = True
                     break
