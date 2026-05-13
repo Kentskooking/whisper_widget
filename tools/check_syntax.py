@@ -31,7 +31,9 @@ def repo_python_files() -> list[Path]:
         stripped = line.strip()
         if not stripped:
             continue
-        paths.append(REPO_ROOT / stripped)
+        path = REPO_ROOT / stripped
+        if path.is_file():
+            paths.append(path)
     return sorted(paths)
 
 

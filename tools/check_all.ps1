@@ -24,7 +24,10 @@ function Invoke-NativeStep {
 
 Push-Location $repoRoot
 try {
-    $pythonFiles = @(git ls-files --cached --others --exclude-standard -- *.py tools/*.py)
+    $pythonFiles = @(
+        git ls-files --cached --others --exclude-standard -- *.py tools/*.py |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+    )
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to list repo Python files."
     }

@@ -35,7 +35,7 @@ except Exception:
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Configuration
-MODEL_SIZE = "large-v3"
+MODEL_SIZE = "turbo"
 WHISPER_DEVICE = "auto"
 WHISPER_WORKER_READY_TIMEOUT_SECONDS = 120
 WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = 180
@@ -58,19 +58,6 @@ VAD_MIN_SPEECH_MS = 150
 VAD_MERGE_GAP_MS = 600
 VAD_REQUEST_TIMEOUT_SECONDS = 180
 VAD_WORKER_READY_TIMEOUT_SECONDS = 30
-NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS = 180
-NOISE_REDUCTION_ENABLED = True
-NOISE_REDUCTION_BACKEND = "webrtc_apm_wsl"
-NOISE_REDUCTION_WEBRTC_PRESET = "light"
-NOISE_REDUCTION_WEBRTC_DISTRO = "Ubuntu-22.04"
-NOISE_REDUCTION_PROP_DECREASE = 0.85
-NOISE_REDUCTION_CHUNK_SECONDS = 10.0
-NOISE_REDUCTION_PADDING_SECONDS = 2.0
-NOISE_REDUCTION_N_FFT = 512
-NORMALIZE_AUDIO_ENABLED = True
-NORMALIZE_TARGET_PEAK_DBFS = -4.0
-NORMALIZE_MAX_GAIN_DB = 16.0
-NORMALIZE_REQUEST_TIMEOUT_SECONDS = 60
 CHUNKED_TRANSCRIPTION_ENABLED = True
 CHUNKED_CHUNK_SECONDS = 30.0
 CHUNKED_OVERLAP_SECONDS = 1.5
@@ -877,171 +864,6 @@ class PersistentWhisperWorkerClient:
             self._terminate_locked(process, reason="close")
 
 
-def reduce_noise_wav(
-    in_wav_path: str,
-    out_wav_path: str,
-    prop_decrease: float = 0.85,
-    chunk_seconds: float = 10.0,
-    padding_seconds: float = 2.0,
-    n_fft: int = 512,
-):
-    """Writes a denoised mono WAV for Whisper preprocessing."""
-    try:
-        import noisereduce as nr
-        import soundfile as sf
-    except Exception as exc:
-        raise RuntimeError("noisereduce or soundfile is not installed") from exc
-
-    audio, sample_rate = sf.read(in_wav_path, dtype="float32")
-    if getattr(audio, "ndim", 1) > 1:
-        audio = audio.mean(axis=1)
-
-    chunk_size = max(n_fft, int(sample_rate * chunk_seconds))
-    padding = max(n_fft, int(sample_rate * padding_seconds))
-
-    reduced_audio = nr.reduce_noise(
-        y=audio,
-        sr=sample_rate,
-        stationary=False,
-        prop_decrease=prop_decrease,
-        chunk_size=chunk_size,
-        padding=padding,
-        n_fft=n_fft,
-    )
-    sf.write(out_wav_path, reduced_audio, sample_rate, subtype="PCM_16")
-
-
-def reduce_noise_wav_subprocess(
-    worker_script_path: str,
-    in_wav_path: str,
-    out_wav_path: str,
-    prop_decrease: float = 0.85,
-    chunk_seconds: float = 10.0,
-    padding_seconds: float = 2.0,
-    n_fft: int = 512,
-    timeout_seconds: float = NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
-):
-    """Runs noise reduction in a child process so native crashes cannot kill the UI."""
-    command = [
-        sys.executable,
-        worker_script_path,
-        "--input",
-        in_wav_path,
-        "--output",
-        out_wav_path,
-        "--prop-decrease",
-        str(prop_decrease),
-        "--chunk-seconds",
-        str(chunk_seconds),
-        "--padding-seconds",
-        str(padding_seconds),
-        "--n-fft",
-        str(n_fft),
-    ]
-    return run_json_subprocess(
-        command=command,
-        cwd=os.path.dirname(worker_script_path) or None,
-        timeout_seconds=timeout_seconds,
-    )
-
-
-def run_json_subprocess(
-    command,
-    cwd: str | None = None,
-    timeout_seconds: float = NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
-):
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
-
-    stdout = completed.stdout.strip()
-    stderr = completed.stderr.strip()
-    if completed.returncode != 0:
-        details = [f"returncode={completed.returncode}"]
-        if stderr:
-            details.append(f"stderr={stderr[:400]}")
-        if stdout:
-            details.append(f"stdout={stdout[:400]}")
-        raise RuntimeError(" ".join(details))
-
-    if not stdout:
-        return {}
-
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"invalid_worker_output={stdout[:400]}") from exc
-
-
-def reduce_noise_wav_webrtc_apm_subprocess(
-    wrapper_script_path: str,
-    in_wav_path: str,
-    out_wav_path: str,
-    preset: str = NOISE_REDUCTION_WEBRTC_PRESET,
-    distro: str = NOISE_REDUCTION_WEBRTC_DISTRO,
-    timeout_seconds: float = NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
-):
-    """Runs WebRTC APM denoise via the local wrapper so the UI process stays isolated."""
-    command = [
-        sys.executable,
-        wrapper_script_path,
-        "--input",
-        in_wav_path,
-        "--output",
-        out_wav_path,
-        "--preset",
-        preset,
-    ]
-    if distro:
-        command.extend(["--distro", distro])
-
-    return run_json_subprocess(
-        command=command,
-        cwd=os.path.dirname(wrapper_script_path) or None,
-        timeout_seconds=timeout_seconds,
-    )
-
-
-def normalize_wav_subprocess(
-    worker_script_path: str,
-    in_wav_path: str,
-    out_wav_path: str,
-    target_peak_dbfs: float = NORMALIZE_TARGET_PEAK_DBFS,
-    max_gain_db: float = NORMALIZE_MAX_GAIN_DB,
-    target_sample_rate: int | None = SAMPLE_RATE,
-    timeout_seconds: float = NORMALIZE_REQUEST_TIMEOUT_SECONDS,
-):
-    """Runs WAV normalization in a child process so native crashes cannot kill the UI."""
-    command = [
-        sys.executable,
-        worker_script_path,
-        "--input",
-        in_wav_path,
-        "--output",
-        out_wav_path,
-        "--target-peak-dbfs",
-        str(target_peak_dbfs),
-        "--max-gain-db",
-        str(max_gain_db),
-    ]
-    if target_sample_rate:
-        command.extend(["--target-sample-rate", str(int(target_sample_rate))])
-
-    result = run_json_subprocess(
-        command=command,
-        cwd=os.path.dirname(worker_script_path) or None,
-        timeout_seconds=timeout_seconds,
-    )
-    if not os.path.exists(out_wav_path) or os.path.getsize(out_wav_path) <= 0:
-        raise RuntimeError("normalizer produced an empty output file")
-    return result
-
-
 class ChunkCaptureSpooler:
     def __init__(
         self,
@@ -1157,10 +979,7 @@ class WhisperWidget(ctk.CTk):
         self.runtime_recovery_path = os.path.join(self.runtime_state_dir, WIDGET_RECOVERY_FILE)
         self.runtime_session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         self.runtime_state_lock = threading.Lock()
-        self.noise_reduce_worker_script = os.path.join(self.base_dir, "noise_reduce_worker.py")
-        self.webrtc_apm_wrapper_script = os.path.join(self.base_dir, "webrtc_apm_wav_wrapper.py")
-        self.normalize_worker_script = os.path.join(self.base_dir, "normalize_worker.py")
-        
+
         # Ensure Log Directory Exists
         os.makedirs(LOG_DIR, exist_ok=True)
         os.makedirs(self.runtime_state_dir, exist_ok=True)
@@ -1198,13 +1017,6 @@ class WhisperWidget(ctk.CTk):
             ready_timeout_seconds=WHISPER_WORKER_READY_TIMEOUT_SECONDS,
             transcribe_timeout_seconds=WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
         )
-        self.log_event(
-            "normalize_worker_config",
-            enabled=NORMALIZE_AUDIO_ENABLED,
-            timeout_seconds=NORMALIZE_REQUEST_TIMEOUT_SECONDS,
-            worker=self.normalize_worker_script,
-        )
-
         # Window Setup
         self.title("Whisper")
         self.geometry("120x120+50+50") # Small square
@@ -1242,8 +1054,6 @@ class WhisperWidget(ctk.CTk):
         self.record_thread = None
         self.sound_lock = threading.Lock()
         self.temp_filename = os.path.join(self.base_dir, "temp_recording.wav")
-        self.temp_denoised_filename = os.path.join(self.base_dir, "temp_denoised.wav")
-        self.temp_normalized_filename = os.path.join(self.base_dir, "temp_normalized.wav")
         self.temp_speech_filename = os.path.join(self.base_dir, "temp_speech_only.wav")
         self.current_raw_backup_path = None
         self.chunk_spooler = None
@@ -1495,8 +1305,6 @@ class WhisperWidget(ctk.CTk):
 
     def reset_temp_audio_files(self, include_raw=False, reason="reset"):
         temp_paths = [
-            self.temp_denoised_filename,
-            self.temp_normalized_filename,
             self.temp_speech_filename,
         ]
         if include_raw:
@@ -1665,8 +1473,6 @@ class WhisperWidget(ctk.CTk):
         self.log_chunk_event("processing_start", chunk_index=chunk_index, file=source_path)
         try:
             speech_path = self.chunk_artifact_path(chunk, "speech_only")
-            denoised_path = self.chunk_artifact_path(chunk, "denoised")
-            normalized_path = self.chunk_artifact_path(chunk, "normalized")
 
             vad_started = time.perf_counter()
             speech_secs = self.vad_client.run(
@@ -1701,97 +1507,6 @@ class WhisperWidget(ctk.CTk):
                 return result
 
             processed_source = speech_path
-            if NOISE_REDUCTION_ENABLED:
-                noise_backend = NOISE_REDUCTION_BACKEND
-                denoise_started = time.perf_counter()
-                if noise_backend == "webrtc_apm_wsl":
-                    worker_result = reduce_noise_wav_webrtc_apm_subprocess(
-                        self.webrtc_apm_wrapper_script,
-                        processed_source,
-                        denoised_path,
-                        preset=NOISE_REDUCTION_WEBRTC_PRESET,
-                        distro=NOISE_REDUCTION_WEBRTC_DISTRO,
-                        timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
-                    )
-                    processed_source = denoised_path
-                    denoise_seconds = time.perf_counter() - denoise_started
-                    result["timings"]["denoise_seconds"] = denoise_seconds
-                    self.log_chunk_event(
-                        "denoise_complete",
-                        chunk_index=chunk_index,
-                        file=processed_source,
-                        backend=noise_backend,
-                        output_sample_rate_hz=worker_result.get("output_sample_rate_hz"),
-                        output_audio_seconds=worker_result.get("seconds"),
-                        processing_seconds=f"{denoise_seconds:.3f}",
-                    )
-                elif noise_backend == "noisereduce_subprocess":
-                    worker_result = reduce_noise_wav_subprocess(
-                        self.noise_reduce_worker_script,
-                        processed_source,
-                        denoised_path,
-                        prop_decrease=NOISE_REDUCTION_PROP_DECREASE,
-                        chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
-                        padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
-                        n_fft=NOISE_REDUCTION_N_FFT,
-                        timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
-                    )
-                    processed_source = denoised_path
-                    denoise_seconds = time.perf_counter() - denoise_started
-                    result["timings"]["denoise_seconds"] = denoise_seconds
-                    self.log_chunk_event(
-                        "denoise_complete",
-                        chunk_index=chunk_index,
-                        file=processed_source,
-                        backend=noise_backend,
-                        output_audio_seconds=worker_result.get("seconds"),
-                        processing_seconds=f"{denoise_seconds:.3f}",
-                    )
-                else:
-                    raise RuntimeError(f"unsupported_noise_reduction_backend={noise_backend}")
-            else:
-                self.log_chunk_event("denoise_skipped", chunk_index=chunk_index)
-
-            if NORMALIZE_AUDIO_ENABLED and processed_source and os.path.exists(processed_source):
-                normalize_started = time.perf_counter()
-                normalize_input = processed_source
-                try:
-                    stats = normalize_wav_subprocess(
-                        self.normalize_worker_script,
-                        normalize_input,
-                        normalized_path,
-                        target_peak_dbfs=NORMALIZE_TARGET_PEAK_DBFS,
-                        max_gain_db=NORMALIZE_MAX_GAIN_DB,
-                        timeout_seconds=NORMALIZE_REQUEST_TIMEOUT_SECONDS,
-                    )
-                    processed_source = normalized_path
-                    normalize_seconds = time.perf_counter() - normalize_started
-                    result["timings"]["normalize_seconds"] = normalize_seconds
-                    self.log_chunk_event(
-                        "normalize_complete",
-                        chunk_index=chunk_index,
-                        file=processed_source,
-                        gain_db=f"{stats['gain_db']:.2f}",
-                        input_peak_dbfs=f"{stats['input_peak_dbfs']:.2f}",
-                        output_peak_dbfs=f"{stats['output_peak_dbfs']:.2f}",
-                        input_sample_rate_hz=stats["input_sample_rate"],
-                        output_sample_rate_hz=stats["sample_rate"],
-                        processing_seconds=f"{normalize_seconds:.3f}",
-                    )
-                except Exception as e:
-                    normalize_seconds = time.perf_counter() - normalize_started
-                    result["timings"]["normalize_seconds"] = normalize_seconds
-                    self.log_chunk_event(
-                        "normalize_failed_fallback_processed",
-                        chunk_index=chunk_index,
-                        source=normalize_input,
-                        attempted_output=normalized_path,
-                        error=e,
-                        processing_seconds=f"{normalize_seconds:.3f}",
-                    )
-            else:
-                self.log_chunk_event("normalize_skipped", chunk_index=chunk_index)
-
             result["ok"] = True
             result["processed_path"] = processed_source
             result["timings"]["total_seconds"] = time.perf_counter() - started
@@ -2081,8 +1796,6 @@ class WhisperWidget(ctk.CTk):
                 candidates.extend([
                     ("raw", source_path),
                     ("speech_only", f"{root}_speech_only.wav"),
-                    ("denoised", f"{root}_denoised.wav"),
-                    ("normalized", f"{root}_normalized.wav"),
                 ])
 
             processing = result.get("processing") or {}
@@ -2672,8 +2385,6 @@ class WhisperWidget(ctk.CTk):
 
         if speech_secs > 0.0 and processed_source:
             attempt_candidates.append(("speech_only_primary", processed_source, {}))
-            if processed_source != self.temp_denoised_filename and os.path.exists(self.temp_denoised_filename):
-                attempt_candidates.append(("speech_only_denoised_fallback", self.temp_denoised_filename, {}))
             if processed_source != self.temp_speech_filename and os.path.exists(self.temp_speech_filename):
                 attempt_candidates.append(("speech_only_raw_fallback", self.temp_speech_filename, {}))
 
@@ -2724,8 +2435,6 @@ class WhisperWidget(ctk.CTk):
             os.makedirs(capture_dir, exist_ok=False)
             for source_path, output_name in [
                 (self.temp_filename, "raw.wav"),
-                (self.temp_denoised_filename, "denoised.wav"),
-                (self.temp_normalized_filename, "normalized.wav"),
                 (self.temp_speech_filename, "speech_only.wav"),
             ]:
                 if not os.path.exists(source_path):
@@ -3137,95 +2846,7 @@ class WhisperWidget(ctk.CTk):
             self.log_event("vad_no_speech_detected")
         elif speech_secs > 0.0:
             processed_source = self.temp_speech_filename
-
-            if NOISE_REDUCTION_ENABLED:
-                noise_backend = NOISE_REDUCTION_BACKEND
-                self.log_event("noise_reduction_start", source=processed_source, backend=noise_backend)
-                try:
-                    if noise_backend == "webrtc_apm_wsl":
-                        if not os.path.exists(self.webrtc_apm_wrapper_script):
-                            raise FileNotFoundError(f"Missing WebRTC wrapper: {self.webrtc_apm_wrapper_script}")
-
-                        worker_result = reduce_noise_wav_webrtc_apm_subprocess(
-                            self.webrtc_apm_wrapper_script,
-                            processed_source,
-                            self.temp_denoised_filename,
-                            preset=NOISE_REDUCTION_WEBRTC_PRESET,
-                            distro=NOISE_REDUCTION_WEBRTC_DISTRO,
-                            timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
-                        )
-                        processed_source = self.temp_denoised_filename
-                        self.log_event(
-                            "noise_reduction_complete",
-                            file=processed_source,
-                            backend=noise_backend,
-                            preset=NOISE_REDUCTION_WEBRTC_PRESET,
-                            output_sample_rate_hz=worker_result.get("output_sample_rate_hz"),
-                            output_audio_seconds=worker_result.get("seconds"),
-                            processing_seconds=worker_result.get("elapsed_seconds"),
-                        )
-                    elif noise_backend == "noisereduce_subprocess":
-                        worker_result = reduce_noise_wav_subprocess(
-                            self.noise_reduce_worker_script,
-                            processed_source,
-                            self.temp_denoised_filename,
-                            prop_decrease=NOISE_REDUCTION_PROP_DECREASE,
-                            chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
-                            padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
-                            n_fft=NOISE_REDUCTION_N_FFT,
-                            timeout_seconds=NOISE_REDUCTION_REQUEST_TIMEOUT_SECONDS,
-                        )
-                        processed_source = self.temp_denoised_filename
-                        self.log_event(
-                            "noise_reduction_complete",
-                            file=processed_source,
-                            backend=noise_backend,
-                            chunk_seconds=NOISE_REDUCTION_CHUNK_SECONDS,
-                            padding_seconds=NOISE_REDUCTION_PADDING_SECONDS,
-                            n_fft=NOISE_REDUCTION_N_FFT,
-                            output_audio_seconds=worker_result.get("seconds"),
-                        )
-                    else:
-                        raise RuntimeError(f"unsupported_noise_reduction_backend={noise_backend}")
-                except Exception as e:
-                    print(f"Noise reduction failed, falling back to speech-only audio: {e}")
-                    self.log_event(
-                        "noise_reduction_failed_fallback_speech_only",
-                        backend=noise_backend,
-                        error=e,
-                    )
-
-            if NORMALIZE_AUDIO_ENABLED and processed_source and os.path.exists(processed_source):
-                self.log_event("normalize_start", source=processed_source)
-                try:
-                    stats = normalize_wav_subprocess(
-                        self.normalize_worker_script,
-                        processed_source,
-                        self.temp_normalized_filename,
-                        target_peak_dbfs=NORMALIZE_TARGET_PEAK_DBFS,
-                        max_gain_db=NORMALIZE_MAX_GAIN_DB,
-                        timeout_seconds=NORMALIZE_REQUEST_TIMEOUT_SECONDS,
-                    )
-                    processed_source = self.temp_normalized_filename
-                    self.log_event(
-                        "normalize_complete",
-                        file=processed_source,
-                        gain_db=f"{stats['gain_db']:.2f}",
-                        input_peak_dbfs=f"{stats['input_peak_dbfs']:.2f}",
-                        output_peak_dbfs=f"{stats['output_peak_dbfs']:.2f}",
-                        input_sample_rate_hz=stats["input_sample_rate"],
-                        output_sample_rate_hz=stats["sample_rate"],
-                    )
-                except Exception as e:
-                    print(f"Normalization failed, falling back to processed speech-only audio: {e}")
-                    self.log_event(
-                        "normalize_failed_fallback_processed",
-                        source=processed_source,
-                        attempted_output=self.temp_normalized_filename,
-                        error=e,
-                    )
-        elif NORMALIZE_AUDIO_ENABLED:
-            self.log_event("normalize_skipped", source="no_speech_or_vad_failure")
+            self.log_event("vad_speech_source_ready", file=processed_source)
 
         self.save_debug_audio_files()
 
@@ -3295,8 +2916,6 @@ class WhisperWidget(ctk.CTk):
             self.remove_raw_audio_backup()
             for f in [
                 self.temp_filename,
-                self.temp_denoised_filename,
-                self.temp_normalized_filename,
                 self.temp_speech_filename,
             ]:
                 if os.path.exists(f):
@@ -3320,24 +2939,6 @@ class WhisperWidget(ctk.CTk):
                 except Exception as e:
                     print(f"Could not save backup file: {e}")
                     self.log_event("transcription_failed_backup_save_error", error=e)
-
-            if os.path.exists(self.temp_denoised_filename):
-                try:
-                    failed_denoised_filename = os.path.join(self.base_dir, f"failed_denoised_{timestamp}.wav")
-                    os.rename(self.temp_denoised_filename, failed_denoised_filename)
-                    self.log_event("transcription_failed_denoised_saved", file=failed_denoised_filename)
-                except:
-                    self.log_event("transcription_failed_denoised_save_failed")
-                    pass
-
-            if os.path.exists(self.temp_normalized_filename):
-                try:
-                    failed_normalized_filename = os.path.join(self.base_dir, f"failed_normalized_{timestamp}.wav")
-                    os.rename(self.temp_normalized_filename, failed_normalized_filename)
-                    self.log_event("transcription_failed_normalized_saved", file=failed_normalized_filename)
-                except:
-                    self.log_event("transcription_failed_normalized_save_failed")
-                    pass
 
             if os.path.exists(self.temp_speech_filename):
                 try:

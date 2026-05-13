@@ -8,11 +8,11 @@ A standalone, always-on-top desktop widget for instant speech-to-text transcript
 - **Drag & Drop:** Click and drag the widget to position it anywhere.
 - **Auto Copy:** Transcription is automatically copied to your clipboard.
 - **Smart Transcription:**
-  - **VAD First:** Uses Silero VAD on the raw recording to isolate speech before heavier processing.
-  - **Speech Cleanup:** Applies chunked `noisereduce` denoising and conservative peak normalization to the speech-only audio before Whisper.
-  - **Progressive Fallbacks:** Falls back across processed speech-only audio and raw full-audio transcription attempts if needed.
+  - **VAD First:** Uses Silero VAD on the raw recording to isolate speech before Whisper.
+  - **Simple Audio Path:** Sends VAD speech-only audio directly to Whisper without in-app denoise or normalization.
+  - **Progressive Fallbacks:** Falls back to raw full-audio transcription attempts if needed.
 - **Transcription Logs:** Saves daily transcription logs to the `transcriptions` folder.
-- **Debug Audio Capture:** Saves `raw.wav`, `speech_only.wav`, `denoised.wav`, and `normalized.wav` in timestamped folders under `debug_audio/` for comparison and model testing.
+- **Debug Audio Capture:** Saves `raw.wav` and `speech_only.wav` in timestamped folders under `debug_audio/` for comparison and model testing.
 - **Runtime Event Logs:** Writes runtime diagnostics to `event_log.txt` in the project root without storing transcription text.
   - The active log rotates at 5 MB and retains `event_log.1.txt` and `event_log.2.txt`.
   - On Windows the active log and rotated archives are marked hidden. View them with `Get-Content -Force .\\event_log.txt`.
@@ -62,11 +62,10 @@ That runner performs:
 - `ruff check` on the same repo `.py` files with a minimal low-noise ruleset (`E9` and `F`)
 - `git diff --check` for whitespace and patch hygiene
 
-### WSL WebRTC noise reduction
-The default noise-reduction backend is `webrtc_apm_wsl`, which runs the native
-WebRTC Audio Processing Module helper through WSL. See
-[docs/WSL_WEBRTC_APM.md](docs/WSL_WEBRTC_APM.md) for the Ubuntu dependencies,
-build command, direct test command, widget configuration, and git hygiene notes.
+### Microphone Cleanup
+The app does not run its own denoise or normalization stages. Configure any
+microphone cleanup upstream at the Windows input-device level, such as selecting
+a virtual microphone that already applies the desired processing.
 
 ## Controls
 - **Click & Drag:** Move the widget.
@@ -76,11 +75,27 @@ build command, direct test command, widget configuration, and git hygiene notes.
 
 ## Configuration
 You can edit the `Configuration` section at the top of `whisper_widget.py` to change:
-- `MODEL_SIZE` (default: `large-v3`) - Common alternatives to test are `turbo` and `medium`.
+- `MODEL_SIZE` (default: `turbo`) - Common alternatives to test are `large-v3` and `medium`.
 - `HOTKEY` (default: `f8`) - Change global shortcut.
 - `CUDA_VISIBLE_DEVICES` - Adjust GPU targeting if you have multiple GPUs.
-- `NOISE_REDUCTION_ENABLED`, `NOISE_REDUCTION_PROP_DECREASE`, `NOISE_REDUCTION_CHUNK_SECONDS`, `NOISE_REDUCTION_PADDING_SECONDS`, `NOISE_REDUCTION_N_FFT` - Tune denoising behavior and long-recording stability.
-- `NORMALIZE_AUDIO_ENABLED`, `NORMALIZE_TARGET_PEAK_DBFS`, `NORMALIZE_MAX_GAIN_DB` - Tune conservative peak normalization after denoise.
 - `SAVE_DEBUG_AUDIO` - Keep or disable timestamped debug audio capture under `debug_audio/`.
 - `EVENT_LOG_MAX_BYTES`, `EVENT_LOG_BACKUP_COUNT` - Control event log rotation size and retained archives.
-- `NOISE_REDUCTION_BACKEND`, `NOISE_REDUCTION_WEBRTC_PRESET`, `NOISE_REDUCTION_WEBRTC_DISTRO` - Configure the WSL WebRTC APM helper.
+
+Valid `MODEL_SIZE` values from the installed `openai-whisper` package:
+
+```text
+tiny.en
+tiny
+base.en
+base
+small.en
+small
+medium.en
+medium
+large-v1
+large-v2
+large-v3
+large
+large-v3-turbo
+turbo
+```
