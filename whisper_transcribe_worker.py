@@ -40,22 +40,74 @@ def load_worker_model(model_size: str, requested_device: str):
     import whisper
 
     device = resolve_device(requested_device, torch)
+    use_cuda = str(device).startswith("cuda")
+    load_device = "cpu" if use_cuda else device
     started = time.perf_counter()
     with redirect_library_stdout():
-        model = whisper.load_model(model_size, device=device)
-    return model, device, time.perf_counter() - started
+        model = whisper.load_model(model_size, device=load_device)
+    if use_cuda:
+        model = model.half().to(device)
+        for module in model.modules():
+            if isinstance(module, torch.nn.LayerNorm):
+                module.float()
+        torch.cuda.empty_cache()
+    model_dtype = str(next(model.parameters()).dtype)
+    layer_norm_dtype = next(
+        (
+            str(next(module.parameters()).dtype)
+            for module in model.modules()
+            if isinstance(module, torch.nn.LayerNorm)
+        ),
+        None,
+    )
+    cuda_memory = {}
+    if use_cuda:
+        device_index = torch.device(device).index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        cuda_memory = {
+            "cuda_allocated_mb": round(
+                torch.cuda.memory_allocated(device_index) / 1024 / 1024,
+                1,
+            ),
+            "cuda_reserved_mb": round(
+                torch.cuda.memory_reserved(device_index) / 1024 / 1024,
+                1,
+            ),
+        }
+    return (
+        model,
+        device,
+        load_device,
+        model_dtype,
+        layer_norm_dtype,
+        cuda_memory,
+        time.perf_counter() - started,
+    )
 
 
 def run_server(args) -> int:
     try:
-        model, device, load_seconds = load_worker_model(args.model, args.device)
+        (
+            model,
+            device,
+            load_device,
+            model_dtype,
+            layer_norm_dtype,
+            cuda_memory,
+            load_seconds,
+        ) = load_worker_model(args.model, args.device)
         emit_message({
             "type": "ready",
             "ok": True,
             "pid": os.getpid(),
             "model": args.model,
             "device": device,
+            "load_device": load_device,
+            "model_dtype": model_dtype,
+            "layer_norm_dtype": layer_norm_dtype,
             "load_seconds": load_seconds,
+            **cuda_memory,
         })
     except Exception as e:
         emit_message({

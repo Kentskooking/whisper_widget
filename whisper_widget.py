@@ -699,6 +699,11 @@ class PersistentWhisperWorkerClient:
                             worker_pid=message.get("pid"),
                             model=message.get("model"),
                             device=message.get("device"),
+                            load_device=message.get("load_device"),
+                            model_dtype=message.get("model_dtype"),
+                            layer_norm_dtype=message.get("layer_norm_dtype"),
+                            cuda_allocated_mb=message.get("cuda_allocated_mb"),
+                            cuda_reserved_mb=message.get("cuda_reserved_mb"),
                             load_seconds=f"{float(message.get('load_seconds') or 0.0):.3f}",
                         )
                     else:
@@ -1941,10 +1946,18 @@ class WhisperWidget(ctk.CTk):
             recovery_candidate = self.load_startup_recovery_candidate()
             if recovery_candidate is None:
                 self.ui_call(self.update_ui_state, "ready")
-            print("Whisper worker ready.")
+            print(
+                "Whisper worker ready "
+                f"({ready_payload.get('device')}, {ready_payload.get('model_dtype')})."
+            )
             self.log_event(
                 "model_load_success",
                 device=ready_payload.get("device"),
+                load_device=ready_payload.get("load_device"),
+                model_dtype=ready_payload.get("model_dtype"),
+                layer_norm_dtype=ready_payload.get("layer_norm_dtype"),
+                cuda_allocated_mb=ready_payload.get("cuda_allocated_mb"),
+                cuda_reserved_mb=ready_payload.get("cuda_reserved_mb"),
                 model=ready_payload.get("model"),
                 launcher_pid=ready_payload.get("launcher_pid"),
                 worker_pid=ready_payload.get("pid"),
