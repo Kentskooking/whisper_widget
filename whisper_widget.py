@@ -35,7 +35,7 @@ except Exception:
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Configuration
-MODEL_SIZE = "turbo"
+MODEL_SIZE = "large-v3"
 WHISPER_DEVICE = "auto"
 WHISPER_WORKER_READY_TIMEOUT_SECONDS = 120
 WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = 180
