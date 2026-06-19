@@ -118,6 +118,15 @@ INDEX_HTML = """<!doctype html>
       height: 18px;
       accent-color: var(--blue);
     }
+    #waveform {
+      width: 100%;
+      height: 34px;
+      display: block;
+      margin: -2px 0 -4px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #14171c;
+    }
     textarea {
       width: 100%;
       min-height: min(54vh, 520px);
@@ -144,6 +153,7 @@ INDEX_HTML = """<!doctype html>
       .status { text-align: left; }
       button { flex: 1 1 130px; }
       label { flex-basis: 100%; }
+      #waveform { height: 30px; }
     }
   </style>
 </head>
@@ -159,6 +169,7 @@ INDEX_HTML = """<!doctype html>
       <button id="copyButton" type="button" disabled>Copy</button>
       <label><input id="autoCopy" type="checkbox"> Auto-copy</label>
     </section>
+    <canvas id="waveform" aria-hidden="true"></canvas>
     <textarea id="transcript" spellcheck="true" placeholder="Transcript"></textarea>
     <div id="meta" class="meta"></div>
   </main>
@@ -170,6 +181,8 @@ INDEX_HTML = """<!doctype html>
     const statusEl = document.getElementById("status");
     const transcriptEl = document.getElementById("transcript");
     const metaEl = document.getElementById("meta");
+    const waveformCanvas = document.getElementById("waveform");
+    const waveformCtx = waveformCanvas.getContext("2d");
 
     let mediaStream = null;
     let audioContext = null;
@@ -193,6 +206,10 @@ INDEX_HTML = """<!doctype html>
     let uploadChain = Promise.resolve();
     let uploadFailure = null;
     let resampler = null;
+    let waveformLevels = [];
+    let waveformAnimationId = 0;
+    let waveformActive = false;
+    const waveformMaxLevels = 180;
 
     function setStatus(text, className = "") {
       statusEl.textContent = text;
@@ -260,6 +277,7 @@ INDEX_HTML = """<!doctype html>
       uploadFailure = null;
       uploadChain = Promise.resolve();
       resampler = null;
+      resetWaveform();
     }
 
     function floatToInt16Sample(value) {
@@ -273,6 +291,111 @@ INDEX_HTML = """<!doctype html>
         output[i] = floatToInt16Sample(floatSamples[i]);
       }
       return output;
+    }
+
+    function resizeWaveformCanvas() {
+      const pixelRatio = window.devicePixelRatio || 1;
+      const rect = waveformCanvas.getBoundingClientRect();
+      const width = Math.max(1, Math.round(rect.width * pixelRatio));
+      const height = Math.max(1, Math.round(rect.height * pixelRatio));
+      if (waveformCanvas.width !== width || waveformCanvas.height !== height) {
+        waveformCanvas.width = width;
+        waveformCanvas.height = height;
+      }
+      waveformCtx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    }
+
+    function resetWaveform() {
+      waveformActive = false;
+      waveformLevels = new Array(waveformMaxLevels).fill(0);
+      stopWaveformAnimation();
+      drawWaveform();
+    }
+
+    function startWaveform() {
+      waveformActive = true;
+      startWaveformAnimation();
+    }
+
+    function stopWaveform() {
+      waveformActive = false;
+      startWaveformAnimation();
+    }
+
+    function startWaveformAnimation() {
+      if (!waveformAnimationId) {
+        waveformAnimationId = window.requestAnimationFrame(renderWaveformFrame);
+      }
+    }
+
+    function stopWaveformAnimation() {
+      if (waveformAnimationId) {
+        window.cancelAnimationFrame(waveformAnimationId);
+      }
+      waveformAnimationId = 0;
+    }
+
+    function renderWaveformFrame() {
+      waveformAnimationId = 0;
+      let maxLevel = 0;
+      if (!waveformActive) {
+        for (let index = 0; index < waveformLevels.length; index += 1) {
+          waveformLevels[index] *= 0.82;
+          maxLevel = Math.max(maxLevel, waveformLevels[index]);
+        }
+      }
+      drawWaveform();
+      if (waveformActive || maxLevel > 0.003) {
+        startWaveformAnimation();
+      }
+    }
+
+    function drawWaveform() {
+      resizeWaveformCanvas();
+      const width = waveformCanvas.clientWidth;
+      const height = waveformCanvas.clientHeight;
+      const mid = height / 2;
+      waveformCtx.clearRect(0, 0, width, height);
+      waveformCtx.fillStyle = "#14171c";
+      waveformCtx.fillRect(0, 0, width, height);
+      waveformCtx.strokeStyle = "rgba(170, 178, 192, 0.18)";
+      waveformCtx.lineWidth = 1;
+      waveformCtx.beginPath();
+      waveformCtx.moveTo(10, mid);
+      waveformCtx.lineTo(width - 10, mid);
+      waveformCtx.stroke();
+
+      const usableWidth = Math.max(1, width - 20);
+      const step = usableWidth / Math.max(1, waveformLevels.length - 1);
+      waveformCtx.strokeStyle = waveformActive
+        ? "rgba(73, 190, 125, 0.88)"
+        : "rgba(139, 153, 173, 0.5)";
+      waveformCtx.lineWidth = Math.max(1, Math.min(3, step * 0.48));
+      waveformCtx.beginPath();
+      for (let index = 0; index < waveformLevels.length; index += 1) {
+        const level = Math.min(1, Math.max(0, waveformLevels[index]));
+        const x = 10 + index * step;
+        const amp = Math.max(1, level * height * 0.42);
+        waveformCtx.moveTo(x, mid - amp);
+        waveformCtx.lineTo(x, mid + amp);
+      }
+      waveformCtx.stroke();
+    }
+
+    function feedWaveform(floatSamples) {
+      if (!floatSamples || !floatSamples.length) {
+        return;
+      }
+
+      let peak = 0;
+      for (let index = 0; index < floatSamples.length; index += 1) {
+        peak = Math.max(peak, Math.abs(floatSamples[index] || 0));
+      }
+
+      waveformLevels.push(Math.min(1, peak * 3.5));
+      while (waveformLevels.length > waveformMaxLevels) {
+        waveformLevels.shift();
+      }
     }
 
     class PcmResampler {
@@ -439,6 +562,7 @@ INDEX_HTML = """<!doctype html>
         recordingStartedAt = performance.now();
         startStatusPolling();
         await audioContext.resume();
+        startWaveform();
 
         stopButton.disabled = false;
         setStatus("Recording", "recording");
@@ -527,6 +651,7 @@ INDEX_HTML = """<!doctype html>
           track.stop();
         }
       }
+      stopWaveform();
       mediaStream = null;
       audioContext = null;
       sourceNode = null;
@@ -538,6 +663,7 @@ INDEX_HTML = """<!doctype html>
       if (!chunkConfig || !floatSamples || !floatSamples.length) {
         return;
       }
+      feedWaveform(floatSamples);
       const pcmSamples = resampler ? resampler.process(floatSamples) : floatsToInt16(floatSamples);
       appendPcmSamples(pcmSamples);
     }
@@ -807,6 +933,8 @@ INDEX_HTML = """<!doctype html>
     recordButton.addEventListener("click", startRecording);
     stopButton.addEventListener("click", stopRecording);
     copyButton.addEventListener("click", copyTranscript);
+    window.addEventListener("resize", drawWaveform);
+    resetWaveform();
     refreshHealth();
     window.setInterval(refreshHealth, 10000);
   </script>
