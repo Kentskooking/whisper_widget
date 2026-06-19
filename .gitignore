@@ -50,10 +50,13 @@ Thumbs.db
 *.log
 event_log.txt
 event_log.*.txt
+web_event_log.txt
+web_event_log.*.txt
 
 # Local temp artifacts
 temp_*.wav
 chunked_transcription_work/
+web_transcription_work/
 
 # Local audio/media artifacts
 *.wav

@@ -8,3 +8,6 @@ pyperclip==1.11.0
 torch==2.5.1+cu121
 torchaudio==2.5.1+cu121
 numpy==1.26.4
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17

@@ -15,6 +15,7 @@ import pyperclip
 import math
 import struct
 import io
+import tempfile
 import warnings
 import faulthandler
 from queue import Queue, Empty, Full
@@ -68,6 +69,17 @@ CHUNKED_KEEP_TEMP_ON_SUCCESS = False
 CHUNKED_KEEP_TEMP_ON_FAILURE = True
 CHUNKED_SAVE_DEBUG_ARTIFACTS = True
 CHUNKED_WHISPER_MAX_ATTEMPTS = 2
+WEB_SERVER_ENABLED = os.environ.get("WHISPER_WIDGET_WEB_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+WEB_SERVER_HOST = os.environ.get("WHISPER_WEB_HOST", "127.0.0.1")
+WEB_SERVER_PORT = int(os.environ.get("WHISPER_WEB_PORT", "8765"))
+WEB_SERVER_SSL_CERTFILE = os.environ.get("WHISPER_WEB_SSL_CERTFILE") or None
+WEB_SERVER_SSL_KEYFILE = os.environ.get("WHISPER_WEB_SSL_KEYFILE") or None
+WEB_WORK_DIR = "web_transcription_work"
 RUNTIME_STATE_DIR = os.path.join("sidecache", "runtime")
 WIDGET_HEARTBEAT_FILE = "widget_heartbeat.json"
 WIDGET_RECOVERY_FILE = "widget_recovery.json"
@@ -485,6 +497,10 @@ class PersistentVADWorkerClient:
             if not self._ready:
                 raise RuntimeError(self._last_start_error or "VAD worker failed to start")
 
+    def is_ready(self):
+        with self._lock:
+            return bool(self._ready and self._process is not None and self._process.poll() is None)
+
     def run(
         self,
         in_wav_path: str,
@@ -759,6 +775,10 @@ class PersistentWhisperWorkerClient:
         with self._lock:
             return bool(self._ready and self._process is not None and self._process.poll() is None)
 
+    def ready_payload(self):
+        with self._lock:
+            return dict(self._last_ready_payload)
+
     def restart(self, reason: str = "restart_requested"):
         with self._lock:
             process = self._process
@@ -992,9 +1012,11 @@ class WhisperWidget(ctk.CTk):
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
         self.raw_audio_backup_dir = os.path.join(self.base_dir, RAW_AUDIO_BACKUP_DIR)
         self.chunked_temp_dir = os.path.join(self.base_dir, CHUNKED_TEMP_DIR)
+        self.web_work_dir = os.path.join(self.base_dir, WEB_WORK_DIR)
         if SAVE_DEBUG_AUDIO:
             os.makedirs(self.debug_audio_dir, exist_ok=True)
         os.makedirs(self.raw_audio_backup_dir, exist_ok=True)
+        os.makedirs(self.web_work_dir, exist_ok=True)
         self.event_logger = EventLogger(self.event_log_path)
         self.log_event(
             "app_start",
@@ -1068,6 +1090,8 @@ class WhisperWidget(ctk.CTk):
         self.chunk_transcribe_results = {}
         self.chunk_transcribe_lock = threading.Lock()
         self.chunk_pipeline_failed = False
+        self.web_pipeline_lock = threading.Lock()
+        self.web_server = None
         self.startup_recovery_thread = None
         self.recovery_state = {"active": False}
         self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
@@ -1127,6 +1151,7 @@ class WhisperWidget(ctk.CTk):
         self.register_hotkey()
         self.reassert_topmost()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.start_web_server()
         self.log_event("app_ready")
         self.write_runtime_heartbeat(reason="app_ready")
 
@@ -1153,6 +1178,55 @@ class WhisperWidget(ctk.CTk):
         if chunk_index is not None:
             fields["chunk_index"] = chunk_index
         self.log_event(f"chunk_{event}", **fields)
+
+    def start_web_server(self):
+        if not WEB_SERVER_ENABLED:
+            self.log_event("web_widget_server_disabled")
+            return
+
+        try:
+            from widget_web_server import WhisperWidgetWebServer
+
+            self.web_server = WhisperWidgetWebServer(
+                widget=self,
+                host=WEB_SERVER_HOST,
+                port=WEB_SERVER_PORT,
+                work_dir=self.web_work_dir,
+                ssl_certfile=WEB_SERVER_SSL_CERTFILE,
+                ssl_keyfile=WEB_SERVER_SSL_KEYFILE,
+                log_fn=self.log_event,
+            )
+            self.web_server.start()
+            self.log_event("web_widget_server_started", host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+        except Exception as e:
+            self.web_server = None
+            self.log_event("web_widget_server_start_failed", host=WEB_SERVER_HOST, port=WEB_SERVER_PORT, error=e)
+
+    def stop_web_server(self):
+        if self.web_server is None:
+            return
+
+        try:
+            self.web_server.stop()
+        except Exception as e:
+            self.log_event("web_widget_server_stop_failed", error=e)
+        finally:
+            self.web_server = None
+
+    def web_status_payload(self):
+        ready_payload = self.whisper_client.ready_payload()
+        return {
+            "ok": True,
+            "model_ready": self.is_whisper_ready(),
+            "vad_ready": self.vad_client.is_ready(),
+            "busy": bool(self.is_recording or self.is_processing or self.web_pipeline_lock.locked()),
+            "recording": bool(self.is_recording),
+            "processing": bool(self.is_processing),
+            "model": ready_payload.get("model") or MODEL_SIZE,
+            "device": ready_payload.get("device") or WHISPER_DEVICE,
+            "worker_pid": ready_payload.get("worker_pid"),
+            "launcher_pid": ready_payload.get("launcher_pid"),
+        }
 
     def build_runtime_heartbeat_payload(self, status=None, reason=None):
         listener_alive = bool(self.hotkey_listener_thread and self.hotkey_listener_thread.is_alive())
@@ -2393,18 +2467,33 @@ class WhisperWidget(ctk.CTk):
         return b''.join(audio_data)
 
     def build_transcribe_attempts(self, speech_secs, processed_source):
+        return self.build_transcribe_attempts_for_paths(
+            raw_path=self.temp_filename,
+            speech_path=self.temp_speech_filename,
+            speech_secs=speech_secs,
+            processed_source=processed_source,
+        )
+
+    def build_transcribe_attempts_for_paths(
+        self,
+        raw_path,
+        speech_path,
+        speech_secs,
+        processed_source=None,
+    ):
         base_options = self.base_transcribe_options()
         attempt_candidates = []
+        processed_source = processed_source or speech_path
 
         if speech_secs > 0.0 and processed_source:
             attempt_candidates.append(("speech_only_primary", processed_source, {}))
-            if processed_source != self.temp_speech_filename and os.path.exists(self.temp_speech_filename):
-                attempt_candidates.append(("speech_only_raw_fallback", self.temp_speech_filename, {}))
+            if processed_source != speech_path and speech_path and os.path.exists(speech_path):
+                attempt_candidates.append(("speech_only_raw_fallback", speech_path, {}))
 
-        attempt_candidates.append(("raw_full_fallback", self.temp_filename, {}))
+        attempt_candidates.append(("raw_full_fallback", raw_path, {}))
         attempt_candidates.append((
             "raw_full_permissive",
-            self.temp_filename,
+            raw_path,
             {
                 "compression_ratio_threshold": None,
                 "logprob_threshold": None,
@@ -2463,6 +2552,278 @@ class WhisperWidget(ctk.CTk):
             self.log_event("debug_audio_capture_saved", dir=capture_dir, files=saved_files)
         except Exception as e:
             self.log_event("debug_audio_capture_failed", error=e)
+
+    def save_web_debug_audio_files(self, raw_path, speech_path, request_id):
+        if not SAVE_DEBUG_AUDIO:
+            return None
+
+        capture_dir = os.path.join(self.debug_audio_dir, "web", request_id)
+        saved_files = 0
+        try:
+            os.makedirs(capture_dir, exist_ok=False)
+            for source_path, output_name in [
+                (raw_path, "raw.wav"),
+                (speech_path, "speech_only.wav"),
+            ]:
+                if not source_path or not os.path.exists(source_path):
+                    continue
+                shutil.copy2(source_path, os.path.join(capture_dir, output_name))
+                saved_files += 1
+
+            if saved_files == 0:
+                os.rmdir(capture_dir)
+                self.log_event("web_debug_audio_capture_empty", request_id=request_id)
+                return None
+
+            self.log_event(
+                "web_debug_audio_capture_saved",
+                request_id=request_id,
+                dir=capture_dir,
+                files=saved_files,
+            )
+            return capture_dir
+        except Exception as e:
+            self.log_event("web_debug_audio_capture_failed", request_id=request_id, error=e)
+            return None
+
+    def transcribe_web_wav(self, wav_path, source_label="web_upload"):
+        if self.is_recording or self.is_processing:
+            self.log_event(
+                "web_transcription_rejected_busy",
+                recording=self.is_recording,
+                processing=self.is_processing,
+            )
+            return {
+                "ok": False,
+                "busy": True,
+                "text": "",
+                "error": "Widget is busy recording or processing.",
+                "timings": {},
+            }
+
+        if not self.web_pipeline_lock.acquire(blocking=False):
+            self.log_event("web_transcription_rejected_lock_busy")
+            return {
+                "ok": False,
+                "busy": True,
+                "text": "",
+                "error": "Another web transcription is already running.",
+                "timings": {},
+            }
+
+        wav_path = os.path.abspath(wav_path)
+        request_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        request_dir = tempfile.mkdtemp(prefix=f"{request_id}_", dir=self.web_work_dir)
+        raw_path = os.path.join(request_dir, "raw.wav")
+        speech_path = os.path.join(request_dir, "speech_only.wav")
+        started = time.perf_counter()
+        timings = {}
+        attempts_payload = []
+        text = ""
+        success = False
+        speech_secs = 0.0
+        completed_attempts = 0
+
+        try:
+            self.is_processing = True
+            self.ui_call(self.update_ui_state, "processing")
+            self.write_runtime_heartbeat(reason="web_transcription_start")
+            self.log_event(
+                "web_transcription_pipeline_start",
+                request_id=request_id,
+                source=wav_path,
+                source_label=source_label,
+            )
+
+            self.whisper_client.ensure_ready(timeout_seconds=WHISPER_WORKER_READY_TIMEOUT_SECONDS)
+            self.whisper_ready = self.whisper_client.is_ready()
+            shutil.copy2(wav_path, raw_path)
+            self.log_event("web_transcription_source_staged", request_id=request_id, file=raw_path)
+
+            vad_started = time.perf_counter()
+            try:
+                speech_secs = self.vad_client.run(
+                    in_wav_path=raw_path,
+                    out_wav_path=speech_path,
+                    sample_rate=SAMPLE_RATE,
+                    pad_ms=VAD_PAD_MS,
+                    min_speech_ms=VAD_MIN_SPEECH_MS,
+                    merge_gap_ms=VAD_MERGE_GAP_MS,
+                    speech_prob_threshold=0.5,
+                )
+                timings["vad_seconds"] = time.perf_counter() - vad_started
+                self.log_event(
+                    "web_vad_complete",
+                    request_id=request_id,
+                    speech_secs=f"{speech_secs:.3f}",
+                    processing_seconds=f"{timings['vad_seconds']:.3f}",
+                )
+            except Exception as e:
+                timings["vad_seconds"] = time.perf_counter() - vad_started
+                speech_secs = -1.0
+                self.log_event("web_vad_failed_fallback_raw", request_id=request_id, error=e)
+
+            if speech_secs == 0.0:
+                self.log_event("web_vad_no_speech_detected", request_id=request_id)
+            elif speech_secs > 0.0:
+                self.log_event("web_vad_speech_source_ready", request_id=request_id, file=speech_path)
+
+            debug_dir = self.save_web_debug_audio_files(raw_path, speech_path, request_id)
+            attempts = self.build_transcribe_attempts_for_paths(
+                raw_path=raw_path,
+                speech_path=speech_path,
+                speech_secs=speech_secs,
+                processed_source=speech_path if speech_secs > 0.0 else None,
+            )
+            whisper_total = 0.0
+
+            for attempt_number, attempt in enumerate(attempts, start=1):
+                attempt_started = time.perf_counter()
+                attempt_payload = {
+                    "attempt": attempt_number,
+                    "stage": attempt["label"],
+                    "ok": False,
+                    "text_chars": 0,
+                    "seconds": 0.0,
+                }
+                try:
+                    self.log_event(
+                        "web_transcribe_attempt_start",
+                        request_id=request_id,
+                        attempt=attempt_number,
+                        stage=attempt["label"],
+                        source=attempt["path"],
+                    )
+                    result = self.transcribe_with_whisper(
+                        attempt["path"],
+                        attempt["options"],
+                    )
+                    completed_attempts += 1
+                    elapsed = time.perf_counter() - attempt_started
+                    whisper_total += elapsed
+                    attempt_text = (result.get("text") or "").strip()
+                    attempt_payload.update(
+                        {
+                            "ok": True,
+                            "text_chars": len(attempt_text),
+                            "seconds": elapsed,
+                        }
+                    )
+                    attempts_payload.append(attempt_payload)
+
+                    if attempt_text:
+                        text = attempt_text
+                        success = True
+                        self.log_event(
+                            "web_transcribe_attempt_success",
+                            request_id=request_id,
+                            attempt=attempt_number,
+                            stage=attempt["label"],
+                            chars=len(text),
+                            processing_seconds=f"{elapsed:.3f}",
+                        )
+                        break
+
+                    self.log_event(
+                        "web_transcribe_attempt_no_text",
+                        request_id=request_id,
+                        attempt=attempt_number,
+                        stage=attempt["label"],
+                        processing_seconds=f"{elapsed:.3f}",
+                    )
+                except Exception as e:
+                    elapsed = time.perf_counter() - attempt_started
+                    whisper_total += elapsed
+                    attempt_payload.update(
+                        {
+                            "ok": False,
+                            "error": str(e),
+                            "seconds": elapsed,
+                        }
+                    )
+                    attempts_payload.append(attempt_payload)
+                    self.log_event(
+                        "web_transcribe_attempt_failed",
+                        request_id=request_id,
+                        attempt=attempt_number,
+                        stage=attempt["label"],
+                        error=e,
+                    )
+                    time.sleep(0.5)
+
+            timings["whisper_seconds"] = whisper_total
+            if not success and completed_attempts > 0:
+                success = True
+                self.log_event(
+                    "web_transcribe_all_attempts_empty",
+                    request_id=request_id,
+                    attempts=completed_attempts,
+                )
+
+            if text:
+                self.log_transcription(text)
+
+            timings["total_seconds"] = time.perf_counter() - started
+            self.log_event(
+                "web_transcription_pipeline_finish",
+                request_id=request_id,
+                success=success,
+                chars=len(text),
+                total_seconds=f"{timings['total_seconds']:.3f}",
+            )
+            return {
+                "ok": success,
+                "text": text,
+                "speech_secs": speech_secs,
+                "timings": timings,
+                "attempts": attempts_payload,
+                "debug_dir": debug_dir,
+                "request_id": request_id,
+                **({} if success else {"error": "No transcription attempt completed successfully"}),
+            }
+        except Exception as e:
+            timings["total_seconds"] = time.perf_counter() - started
+            self.log_event(
+                "web_transcription_pipeline_failed",
+                request_id=request_id,
+                error=e,
+                total_seconds=f"{timings['total_seconds']:.3f}",
+            )
+            return {
+                "ok": False,
+                "text": "",
+                "speech_secs": speech_secs,
+                "timings": timings,
+                "attempts": attempts_payload,
+                "request_id": request_id,
+                "error": str(e),
+            }
+        finally:
+            keep_temp = not success
+            if keep_temp:
+                self.log_event(
+                    "web_transcription_temp_preserved",
+                    request_id=request_id,
+                    dir=request_dir,
+                    success=success,
+                )
+            else:
+                try:
+                    shutil.rmtree(request_dir)
+                    self.log_event(
+                        "web_transcription_temp_removed",
+                        request_id=request_id,
+                        dir=request_dir,
+                    )
+                except Exception as cleanup_error:
+                    self.log_event(
+                        "web_transcription_temp_remove_failed",
+                        request_id=request_id,
+                        dir=request_dir,
+                        error=cleanup_error,
+                    )
+            self.ui_call(self.finish_processing)
+            self.web_pipeline_lock.release()
 
     def create_raw_audio_backup(self, source_path):
         capture_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -2982,6 +3343,7 @@ class WhisperWidget(ctk.CTk):
         self.write_runtime_heartbeat(status="stopping", reason="app_close_start")
         self.shutdown_event.set()
         self.unregister_hotkey()
+        self.stop_web_server()
         self.whisper_client.close()
         self.vad_client.close()
         try:

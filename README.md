@@ -16,6 +16,7 @@ A standalone, always-on-top desktop widget for instant speech-to-text transcript
 - **Runtime Event Logs:** Writes runtime diagnostics to `event_log.txt` in the project root without storing transcription text.
   - The active log rotates at 5 MB and retains `event_log.1.txt` and `event_log.2.txt`.
   - On Windows the active log and rotated archives are marked hidden. View them with `Get-Content -Force .\\event_log.txt`.
+- **Web Recorder MVP:** Runs a browser UI that records from the browser device microphone, uploads the completed recording, and returns the transcript from this machine.
 
 ## Setup
 1. Install dependencies:
@@ -45,6 +46,65 @@ python -m venv .venv
 python -m pip install --upgrade pip "setuptools<81"
 python -m pip install --no-build-isolation -r requirements.txt
 ```
+
+### Embedded web recorder
+The desktop widget now starts the web recorder in the same process by default.
+Use the normal widget launcher:
+```bat
+launch_whisper_widget.bat
+```
+
+By default the embedded web server binds to `127.0.0.1:8765`:
+```text
+http://127.0.0.1:8765
+```
+
+The browser records from the device where the page is open, then sends the completed audio file to the already-running widget. Web requests use the widget's existing VAD and Whisper worker clients, so the model is not loaded a second time.
+
+Override the bind address or port with:
+```bat
+set WHISPER_WEB_HOST=127.0.0.1
+set WHISPER_WEB_PORT=8765
+launch_whisper_widget.bat
+```
+
+Disable the embedded web server with:
+```bat
+set WHISPER_WIDGET_WEB_ENABLED=0
+launch_whisper_widget.bat
+```
+
+`launch_whisper_web_server.bat` still exists as a standalone diagnostic server, but it owns a separate Whisper worker and should not be used for the normal widget-backed web flow.
+
+For another Tailscale device, expose the local server through Tailscale Serve HTTPS so browser microphone and clipboard APIs run in a secure context:
+```bat
+tailscale serve --bg 8765
+tailscale serve status
+```
+
+Then open the HTTPS Tailscale Serve URL shown by `tailscale serve status`.
+
+If Tailscale Serve is not available, run the web server directly with a Tailscale certificate:
+```bat
+mkdir sidecache\certs
+tailscale cert --cert-file sidecache\certs\<machine-fqdn>.crt --key-file sidecache\certs\<machine-fqdn>.key <machine-fqdn>
+set WHISPER_WEB_HOST=0.0.0.0
+set WHISPER_WEB_PORT=8765
+set WHISPER_WEB_SSL_CERTFILE=sidecache\certs\<machine-fqdn>.crt
+set WHISPER_WEB_SSL_KEYFILE=sidecache\certs\<machine-fqdn>.key
+launch_whisper_widget.bat
+```
+
+Then open `https://<machine-fqdn>:8765` from the other device.
+
+For direct tailnet-IP connectivity testing without Tailscale Serve, bind the server to all interfaces:
+```bat
+set WHISPER_WEB_HOST=0.0.0.0
+set WHISPER_WEB_PORT=8765
+launch_whisper_widget.bat
+```
+
+Then open `http://<this-machine-tailscale-ip>:8765` from the other device. This proves network reachability, but browser microphone access may still be blocked because raw tailnet IP HTTP is not a secure context. If it times out while localhost works, check that Windows Firewall allows inbound TCP traffic on the selected port.
 
 ### Dev checks
 Install the dev-only verifier tooling into the same `.venv`:
