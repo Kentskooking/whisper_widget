@@ -1228,6 +1228,21 @@ class WhisperWidget(ctk.CTk):
             "launcher_pid": ready_payload.get("launcher_pid"),
         }
 
+    def web_chunk_config_payload(self):
+        sample_width = self.p.get_sample_size(pyaudio.paInt16)
+        chunk_samples = max(1, int(round(CHUNKED_CHUNK_SECONDS * SAMPLE_RATE)))
+        requested_overlap = max(0, int(round(CHUNKED_OVERLAP_SECONDS * SAMPLE_RATE)))
+        overlap_samples = min(requested_overlap, max(0, chunk_samples - 1))
+        return {
+            "sample_rate": SAMPLE_RATE,
+            "channels": CHANNELS,
+            "sample_width": sample_width,
+            "chunk_seconds": CHUNKED_CHUNK_SECONDS,
+            "overlap_seconds": CHUNKED_OVERLAP_SECONDS,
+            "chunk_samples": chunk_samples,
+            "overlap_samples": overlap_samples,
+        }
+
     def build_runtime_heartbeat_payload(self, status=None, reason=None):
         listener_alive = bool(self.hotkey_listener_thread and self.hotkey_listener_thread.is_alive())
         payload = {
