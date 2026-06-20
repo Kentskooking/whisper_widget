@@ -2011,6 +2011,13 @@ class WhisperWidget(ctk.CTk):
             print(f"Failed to log transcription: {e}")
             self.log_event("transcription_log_failed", error=e)
 
+    def print_transcription_to_terminal(self, text):
+        if not text:
+            return
+        print("\n[transcription]")
+        print(text)
+        print("[/transcription]", flush=True)
+
     def load_model(self):
         """Starts the persistent Whisper worker on a background thread."""
         try:
@@ -2776,6 +2783,7 @@ class WhisperWidget(ctk.CTk):
                 )
 
             if text:
+                self.print_transcription_to_terminal(text)
                 self.log_transcription(text)
 
             timings["total_seconds"] = time.perf_counter() - started

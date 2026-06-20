@@ -1249,6 +1249,8 @@ class RemoteChunkSession:
 
         self.widget.write_chunk_transcript_debug(ordered_results, final_text, reason="web_success")
         if final_text:
+            if hasattr(self.widget, "print_transcription_to_terminal"):
+                self.widget.print_transcription_to_terminal(final_text)
             self.widget.log_transcription(final_text)
         self.manager.log_event(
             "web_chunk_session_complete",
