@@ -209,7 +209,7 @@ INDEX_HTML = """<!doctype html>
     let waveformLevels = [];
     let waveformAnimationId = 0;
     let waveformActive = false;
-    const waveformMaxLevels = 180;
+    const waveformMaxLevels = 1080;
 
     function setStatus(text, className = "") {
       statusEl.textContent = text;
