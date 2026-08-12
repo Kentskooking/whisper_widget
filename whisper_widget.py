@@ -511,7 +511,8 @@ class PersistentVADWorkerClient:
         merge_gap_ms: int = 400,
         speech_prob_threshold: float = 0.5,
         timeout_seconds: int = VAD_REQUEST_TIMEOUT_SECONDS,
-    ) -> float:
+        return_details: bool = False,
+    ) -> float | dict:
         self.ensure_ready()
 
         with self._lock:
@@ -570,7 +571,13 @@ class PersistentVADWorkerClient:
                 error_text = message.get("error") or "VAD worker reported an unknown error"
                 raise RuntimeError(error_text)
 
-            return float(message["speech_secs"])
+            speech_secs = float(message["speech_secs"])
+            if return_details:
+                return {
+                    "speech_secs": speech_secs,
+                    "segments": list(message.get("segments") or []),
+                }
+            return speech_secs
 
     def _terminate_locked(self, process, reason: str):
         if process is None:
@@ -2607,6 +2614,134 @@ class WhisperWidget(ctk.CTk):
         except Exception as e:
             self.log_event("web_debug_audio_capture_failed", request_id=request_id, error=e)
             return None
+
+    def analyze_web_vad(self, wav_path, source_label="web_vad_upload", request_id=None):
+        request_id = request_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        if self.is_recording or self.is_processing:
+            self.log_event(
+                "web_vad_rejected_busy",
+                recording=self.is_recording,
+                processing=self.is_processing,
+            )
+            return {
+                "ok": False,
+                "busy": True,
+                "speech_detected": None,
+                "speech_secs": 0.0,
+                "segments": [],
+                "error": "Widget is busy recording or processing.",
+                "timings": {},
+                "request_id": request_id,
+            }
+
+        if not self.web_pipeline_lock.acquire(blocking=False):
+            self.log_event("web_vad_rejected_lock_busy")
+            return {
+                "ok": False,
+                "busy": True,
+                "speech_detected": None,
+                "speech_secs": 0.0,
+                "segments": [],
+                "error": "Another web audio request is already running.",
+                "timings": {},
+                "request_id": request_id,
+            }
+
+        wav_path = os.path.abspath(wav_path)
+        request_dir = None
+        started = time.perf_counter()
+        timings = {}
+        success = False
+        marked_processing = False
+
+        try:
+            request_dir = tempfile.mkdtemp(prefix=f"vad_{request_id}_", dir=self.web_work_dir)
+            raw_path = os.path.join(request_dir, "raw.wav")
+            speech_path = os.path.join(request_dir, "speech_only.wav")
+            self.is_processing = True
+            marked_processing = True
+            self.ui_call(self.update_ui_state, "processing")
+            self.write_runtime_heartbeat(reason="web_vad_start")
+            self.log_event(
+                "web_vad_start",
+                request_id=request_id,
+                source=wav_path,
+                source_label=source_label,
+            )
+
+            self.vad_client.ensure_ready(timeout_seconds=VAD_WORKER_READY_TIMEOUT_SECONDS)
+            shutil.copy2(wav_path, raw_path)
+
+            vad_started = time.perf_counter()
+            vad_result = self.vad_client.run(
+                in_wav_path=raw_path,
+                out_wav_path=speech_path,
+                sample_rate=SAMPLE_RATE,
+                pad_ms=VAD_PAD_MS,
+                min_speech_ms=VAD_MIN_SPEECH_MS,
+                merge_gap_ms=VAD_MERGE_GAP_MS,
+                speech_prob_threshold=0.5,
+                timeout_seconds=VAD_REQUEST_TIMEOUT_SECONDS,
+                return_details=True,
+            )
+            timings["vad_seconds"] = time.perf_counter() - vad_started
+            timings["total_seconds"] = time.perf_counter() - started
+            speech_secs = float(vad_result["speech_secs"])
+            segments = list(vad_result.get("segments") or [])
+            speech_detected = speech_secs > 0.0
+            success = True
+            self.log_event(
+                "web_vad_finish",
+                request_id=request_id,
+                speech_detected=speech_detected,
+                speech_secs=f"{speech_secs:.3f}",
+                total_seconds=f"{timings['total_seconds']:.3f}",
+            )
+            return {
+                "ok": True,
+                "speech_detected": speech_detected,
+                "speech_secs": speech_secs,
+                "segments": segments,
+                "method": "existing_widget_vad",
+                "timings": timings,
+                "request_id": request_id,
+            }
+        except Exception as e:
+            timings["total_seconds"] = time.perf_counter() - started
+            self.log_event(
+                "web_vad_failed",
+                request_id=request_id,
+                error=e,
+                total_seconds=f"{timings['total_seconds']:.3f}",
+            )
+            return {
+                "ok": False,
+                "speech_detected": None,
+                "speech_secs": 0.0,
+                "segments": [],
+                "timings": timings,
+                "request_id": request_id,
+                "error": str(e),
+            }
+        finally:
+            if request_dir and success:
+                try:
+                    shutil.rmtree(request_dir)
+                    self.log_event("web_vad_temp_removed", request_id=request_id, dir=request_dir)
+                except Exception as cleanup_error:
+                    self.log_event(
+                        "web_vad_temp_remove_failed",
+                        request_id=request_id,
+                        dir=request_dir,
+                        error=cleanup_error,
+                    )
+            elif request_dir:
+                self.log_event("web_vad_temp_preserved", request_id=request_id, dir=request_dir)
+            try:
+                if marked_processing:
+                    self.ui_call(self.finish_processing)
+            finally:
+                self.web_pipeline_lock.release()
 
     def transcribe_web_wav(self, wav_path, source_label="web_upload"):
         if self.is_recording or self.is_processing:

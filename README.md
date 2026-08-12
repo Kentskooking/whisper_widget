@@ -61,6 +61,10 @@ http://127.0.0.1:8765
 
 The browser records from the device where the page is open, then sends the completed audio file to the already-running widget. Web requests use the widget's existing VAD and Whisper worker clients, so the model is not loaded a second time.
 
+Agents and applications can call the widget directly without using the browser recorder. See [Whisper Widget HTTP API](API.md) for the tailnet URL, endpoint contract, error handling, and client examples.
+
+The agent API also provides `POST /api/vad` for the widget's VAD decision and timestamped speech segments without invoking Whisper transcription.
+
 Override the bind address or port with:
 ```bat
 set WHISPER_WEB_HOST=127.0.0.1

@@ -39,7 +39,7 @@ def load_silero_vad():
     return _silero_model, _silero_utils
 
 
-def vad_extract_speech_only(
+def vad_analyze_and_extract(
     in_wav_path: str,
     out_wav_path: str,
     sample_rate: int = 16000,
@@ -47,7 +47,7 @@ def vad_extract_speech_only(
     min_speech_ms: int = 150,
     merge_gap_ms: int = 400,
     speech_prob_threshold: float = 0.5,
-) -> float:
+) -> dict:
     model, utils = load_silero_vad()
     (get_speech_timestamps, save_audio, read_audio, _, collect_chunks) = utils
 
@@ -63,7 +63,7 @@ def vad_extract_speech_only(
     )
 
     if not speech_ts:
-        return 0.0
+        return {"speech_secs": 0.0, "segments": []}
 
     pad = int(sample_rate * (pad_ms / 1000.0))
     n = wav.numel()
@@ -87,7 +87,37 @@ def vad_extract_speech_only(
     save_audio(out_wav_path, speech_audio, sampling_rate=sample_rate)
 
     total_samples = sum(seg["end"] - seg["start"] for seg in merged)
-    return total_samples / sample_rate
+    return {
+        "speech_secs": total_samples / sample_rate,
+        "segments": [
+            {
+                "start_seconds": seg["start"] / sample_rate,
+                "end_seconds": seg["end"] / sample_rate,
+            }
+            for seg in merged
+        ],
+    }
+
+
+def vad_extract_speech_only(
+    in_wav_path: str,
+    out_wav_path: str,
+    sample_rate: int = 16000,
+    pad_ms: int = 250,
+    min_speech_ms: int = 150,
+    merge_gap_ms: int = 400,
+    speech_prob_threshold: float = 0.5,
+) -> float:
+    result = vad_analyze_and_extract(
+        in_wav_path=in_wav_path,
+        out_wav_path=out_wav_path,
+        sample_rate=sample_rate,
+        pad_ms=pad_ms,
+        min_speech_ms=min_speech_ms,
+        merge_gap_ms=merge_gap_ms,
+        speech_prob_threshold=speech_prob_threshold,
+    )
+    return float(result["speech_secs"])
 
 
 def write_result(result_file: str, payload: dict):
@@ -97,7 +127,7 @@ def write_result(result_file: str, payload: dict):
 
 def run_once(args) -> int:
     try:
-        speech_secs = vad_extract_speech_only(
+        result = vad_analyze_and_extract(
             in_wav_path=args.input,
             out_wav_path=args.output,
             sample_rate=args.sample_rate,
@@ -106,7 +136,7 @@ def run_once(args) -> int:
             merge_gap_ms=args.merge_gap_ms,
             speech_prob_threshold=args.threshold,
         )
-        write_result(args.result_file, {"ok": True, "speech_secs": speech_secs})
+        write_result(args.result_file, {"ok": True, **result})
         return 0
     except Exception as e:
         write_result(
@@ -171,7 +201,7 @@ def run_server() -> int:
 
         try:
             with redirect_library_stdout():
-                speech_secs = vad_extract_speech_only(
+                result = vad_analyze_and_extract(
                     in_wav_path=request["input"],
                     out_wav_path=request["output"],
                     sample_rate=int(request["sample_rate"]),
@@ -185,7 +215,7 @@ def run_server() -> int:
                     "type": "response",
                     "request_id": request_id,
                     "ok": True,
-                    "speech_secs": speech_secs,
+                    **result,
                 }
             )
         except Exception as e:

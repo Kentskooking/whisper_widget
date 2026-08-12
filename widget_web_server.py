@@ -1551,6 +1551,82 @@ class WhisperWidgetWebServer:
                     status_code=404,
                 )
 
+        @app.post("/api/vad")
+        def analyze_vad(audio: UploadFile = File(...)):
+            request_started = time.perf_counter()
+            request_id = datetime_session_id()
+            upload_root = os.path.join(self.work_dir, "uploads")
+            os.makedirs(upload_root, exist_ok=True)
+            request_dir = tempfile.mkdtemp(prefix=f"vad_upload_{request_id}_", dir=upload_root)
+            upload_path = None
+            wav_path = os.path.join(request_dir, "converted.wav")
+            success = False
+            remove_request_dir = False
+            convert_seconds = None
+
+            try:
+                upload_path, upload_bytes = save_upload(audio, request_dir)
+                self.log_event(
+                    "web_widget_vad_upload_saved",
+                    file=upload_path,
+                    bytes=upload_bytes,
+                    content_type=audio.content_type,
+                )
+                convert_seconds = convert_to_wav(upload_path, wav_path)
+                self.log_event(
+                    "web_widget_vad_upload_converted",
+                    source=upload_path,
+                    output=wav_path,
+                    convert_seconds=f"{convert_seconds:.3f}",
+                )
+                result = self.widget.analyze_web_vad(
+                    wav_path,
+                    source_label="web_vad_upload",
+                    request_id=request_id,
+                )
+                timings = dict(result.get("timings") or {})
+                timings["convert_seconds"] = convert_seconds
+                timings["total_seconds"] = time.perf_counter() - request_started
+                result["timings"] = timings
+                success = bool(result.get("ok"))
+                remove_request_dir = success or bool(result.get("busy"))
+                status_code = 200 if success else 409 if result.get("busy") else 500
+                return JSONResponse(result, status_code=status_code)
+            except Exception as e:
+                self.log_event("web_widget_vad_failed", file=upload_path, error=e)
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "speech_detected": None,
+                        "speech_secs": 0.0,
+                        "segments": [],
+                        "error": str(e),
+                        "timings": {
+                            **(
+                                {"convert_seconds": convert_seconds}
+                                if convert_seconds is not None
+                                else {}
+                            ),
+                            "total_seconds": time.perf_counter() - request_started,
+                        },
+                        "request_id": request_id,
+                    },
+                    status_code=500,
+                )
+            finally:
+                if remove_request_dir:
+                    try:
+                        shutil.rmtree(request_dir)
+                        self.log_event("web_widget_vad_temp_removed", dir=request_dir)
+                    except Exception as e:
+                        self.log_event(
+                            "web_widget_vad_temp_remove_failed",
+                            dir=request_dir,
+                            error=e,
+                        )
+                else:
+                    self.log_event("web_widget_vad_temp_preserved", dir=request_dir)
+
         @app.post("/api/transcribe")
         def transcribe(audio: UploadFile = File(...)):
             upload_root = os.path.join(self.work_dir, "uploads")
