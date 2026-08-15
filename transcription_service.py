@@ -25,7 +25,7 @@ EVENT_LOG_BACKUP_COUNT = 2
 EVENT_LOG_HEADER = "timestamp | event | details\n"
 DEBUG_AUDIO_DIR = "debug_audio"
 SAVE_DEBUG_AUDIO = True
-WHISPER_LANGUAGE = "en"
+WHISPER_LANGUAGE = None
 WHISPER_NO_SPEECH_THRESHOLD = None
 VAD_PAD_MS = 400
 VAD_MIN_SPEECH_MS = 150
@@ -701,7 +701,7 @@ class TranscriptionServiceConfig:
     model_size: str = MODEL_SIZE
     whisper_device: str = WHISPER_DEVICE
     sample_rate: int = SAMPLE_RATE
-    whisper_language: str = WHISPER_LANGUAGE
+    whisper_language: str | None = WHISPER_LANGUAGE
     whisper_no_speech_threshold: float | None = WHISPER_NO_SPEECH_THRESHOLD
     save_debug_audio: bool = SAVE_DEBUG_AUDIO
     keep_temp_on_success: bool = False

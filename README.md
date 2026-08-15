@@ -139,7 +139,8 @@ a virtual microphone that already applies the desired processing.
 
 ## Configuration
 You can edit the `Configuration` section at the top of `whisper_widget.py` to change:
-- `MODEL_SIZE` (default: `turbo`) - Common alternatives to test are `large-v3` and `medium`.
+- `MODEL_SIZE` (default: `large-v3`) - The default is Whisper's multilingual large model.
+- `WHISPER_LANGUAGE` (default: `None`) - Auto-detect the spoken language; set a language code such as `en` to force one language.
 - `HOTKEY` (default: `f8`) - Change global shortcut.
 - `CUDA_VISIBLE_DEVICES` - Adjust GPU targeting if you have multiple GPUs.
 - `SAVE_DEBUG_AUDIO` - Keep or disable timestamped debug audio capture under `debug_audio/`.
