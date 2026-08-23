@@ -11,7 +11,6 @@ import shutil
 import subprocess
 import json
 import re
-import pyperclip
 import math
 import struct
 import io
@@ -84,6 +83,8 @@ RUNTIME_STATE_DIR = os.path.join("sidecache", "runtime")
 WIDGET_HEARTBEAT_FILE = "widget_heartbeat.json"
 WIDGET_RECOVERY_FILE = "widget_recovery.json"
 FATAL_PYTHON_LOG_FILE = "python_fatal.log"
+CLIPBOARD_WORKER_FILE = "clipboard_worker.py"
+CLIPBOARD_COPY_TIMEOUT_SECONDS = 1.0
 SOUND_CUE_TONES = {
     "notification": [(660, 80)],
     "ready": [(880, 80)],
@@ -2025,6 +2026,61 @@ class WhisperWidget(ctk.CTk):
         print(text)
         print("[/transcription]", flush=True)
 
+    def copy_transcription_to_clipboard(self, text):
+        """Attempt one clipboard write outside the widget process."""
+        if not text:
+            return False
+
+        worker_path = os.path.join(self.base_dir, CLIPBOARD_WORKER_FILE)
+        self.log_event(
+            "clipboard_copy_start",
+            chars=len(text),
+            timeout_seconds=CLIPBOARD_COPY_TIMEOUT_SECONDS,
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+        try:
+            result = subprocess.run(
+                [sys.executable, "-X", "utf8", worker_path],
+                cwd=self.base_dir,
+                input=text,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=CLIPBOARD_COPY_TIMEOUT_SECONDS,
+                check=False,
+                creationflags=creationflags,
+            )
+        except subprocess.TimeoutExpired:
+            self.log_event(
+                "clipboard_copy_abandoned",
+                reason="timeout",
+                chars=len(text),
+                timeout_seconds=CLIPBOARD_COPY_TIMEOUT_SECONDS,
+            )
+            return False
+        except Exception as e:
+            self.log_event(
+                "clipboard_copy_abandoned",
+                reason="worker_start_failed",
+                chars=len(text),
+                error=e,
+            )
+            return False
+
+        if result.returncode != 0:
+            error = (result.stderr or result.stdout or "clipboard worker failed").strip()
+            self.log_event(
+                "clipboard_copy_abandoned",
+                reason="clipboard_busy" if result.returncode == 2 else "worker_failed",
+                chars=len(text),
+                returncode=result.returncode,
+                error=error[-400:],
+            )
+            return False
+
+        self.log_event("clipboard_copy_success", chars=len(text))
+        return True
+
     def load_model(self):
         """Starts the persistent Whisper worker on a background thread."""
         try:
@@ -2136,16 +2192,21 @@ class WhisperWidget(ctk.CTk):
                 print("\n[transcription]")
                 print(text)
                 print("[/transcription]", flush=True)
-                pyperclip.copy(text)
-                print("Copied transcription to clipboard.")
+                self.log_transcription(text)
+                clipboard_copied = self.copy_transcription_to_clipboard(text)
+                if clipboard_copied:
+                    print("Copied transcription to clipboard.")
                 self.log_event(
                     "chunked_transcription_success",
                     chunks=len(chunk_results),
                     chars=len(text),
                     recovered=True,
+                    clipboard_copied=clipboard_copied,
                 )
-                self.log_transcription(text)
-                self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                if clipboard_copied:
+                    self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                else:
+                    self.ui_call(self.record_btn.configure, text="SAVED", fg_color="#ef6c00")
                 self.play_cue("success")
                 time.sleep(1)
             else:
@@ -3228,15 +3289,20 @@ class WhisperWidget(ctk.CTk):
                 print("\n[transcription]")
                 print(text)
                 print("[/transcription]", flush=True)
-                pyperclip.copy(text)
-                print("Copied transcription to clipboard.")
+                self.log_transcription(text)
+                clipboard_copied = self.copy_transcription_to_clipboard(text)
+                if clipboard_copied:
+                    print("Copied transcription to clipboard.")
                 self.log_event(
                     "chunked_transcription_success",
                     chunks=len(chunk_results),
                     chars=len(text),
+                    clipboard_copied=clipboard_copied,
                 )
-                self.log_transcription(text)
-                self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                if clipboard_copied:
+                    self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                else:
+                    self.ui_call(self.record_btn.configure, text="SAVED", fg_color="#ef6c00")
                 self.play_cue("success")
                 time.sleep(1)
             else:
@@ -3404,18 +3470,21 @@ class WhisperWidget(ctk.CTk):
                     print("\n[transcription]")
                     print(text)
                     print("[/transcription]", flush=True)
-                    pyperclip.copy(text)
-                    print("Copied transcription to clipboard.")
+                    self.log_transcription(text)
+                    clipboard_copied = self.copy_transcription_to_clipboard(text)
+                    if clipboard_copied:
+                        print("Copied transcription to clipboard.")
                     self.log_event(
                         "transcribe_attempt_success",
                         attempt=attempt_number,
                         stage=attempt["label"],
-                        chars=len(text)
+                        chars=len(text),
+                        clipboard_copied=clipboard_copied,
                     )
-
-                    self.log_transcription(text)
-
-                    self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                    if clipboard_copied:
+                        self.ui_call(self.record_btn.configure, text="COPIED", fg_color="#1565c0")
+                    else:
+                        self.ui_call(self.record_btn.configure, text="SAVED", fg_color="#ef6c00")
                     self.play_cue("success")
                     time.sleep(1)
                     success = True
