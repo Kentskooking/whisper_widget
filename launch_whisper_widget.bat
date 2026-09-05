@@ -24,6 +24,10 @@ echo [check] Application modules...
 "%PYTHON_EXE%" -u -c "import sys, importlib.util; import app.desktop, app.supervisor, app.transcription_service, app.web.embedded, app.workers.clipboard; modules = ('app.workers.vad', 'app.workers.transcribe', 'app.web.standalone'); missing = [name for name in modules if importlib.util.find_spec(name) is None]; sys.exit('Missing application modules: ' + ', '.join(missing)) if missing else None"
 if errorlevel 1 goto :error
 
+echo [check] Generated data layout...
+"%PYTHON_EXE%" -u -c "from app.paths import check_data_layout; check_data_layout()"
+if errorlevel 1 goto :error
+
 echo [check] Package consistency...
 "%PYTHON_EXE%" -m pip check
 if errorlevel 1 goto :error
@@ -38,7 +42,7 @@ if /i "%~1"=="--check" (
 )
 
 echo [run] Starting Whisper Widget supervisor...
-echo [run] Supervisor restarts are reported here and in sidecache\runtime\supervisor_log.txt.
+echo [run] Supervisor restarts are reported here and in runtime\logs\supervisor_log.txt.
 "%PYTHON_EXE%" -u -m app.supervisor
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" goto :runtime_error

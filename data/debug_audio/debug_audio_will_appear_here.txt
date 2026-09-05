@@ -1,0 +1,3 @@
+Debug audio captures and comparison artifacts will appear here.
+
+This tracked placeholder keeps the folder in Git. Generated files remain ignored.

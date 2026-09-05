@@ -2,7 +2,10 @@ import json
 import os
 import subprocess
 import sys
-from app.paths import REPO_ROOT, DESKTOP_MODULE
+from app.paths import (
+    REPO_ROOT, DESKTOP_MODULE, RUNTIME_STATE_DIR, RUNTIME_LOG_DIR,
+    WIDGET_HEARTBEAT_FILE, check_data_layout,
+)
 import time
 import ctypes
 import traceback
@@ -10,9 +13,9 @@ from datetime import datetime
 
 
 BASE_DIR = str(REPO_ROOT)
-RUNTIME_DIR = os.path.join(BASE_DIR, "sidecache", "runtime")
-HEARTBEAT_PATH = os.path.join(RUNTIME_DIR, "widget_heartbeat.json")
-SUPERVISOR_LOG_PATH = os.path.join(RUNTIME_DIR, "supervisor_log.txt")
+RUNTIME_DIR = os.path.join(BASE_DIR, RUNTIME_STATE_DIR)
+HEARTBEAT_PATH = os.path.join(RUNTIME_DIR, WIDGET_HEARTBEAT_FILE)
+SUPERVISOR_LOG_PATH = os.path.join(BASE_DIR, RUNTIME_LOG_DIR, "supervisor_log.txt")
 POLL_INTERVAL_SECONDS = 1.0
 STARTUP_GRACE_SECONDS = 180.0
 HEARTBEAT_STALE_SECONDS = 45.0
@@ -91,7 +94,7 @@ def log(message: str, **fields):
         line += f" | {details}"
     print(line, flush=True)
     try:
-        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(SUPERVISOR_LOG_PATH), exist_ok=True)
         with open(SUPERVISOR_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as exc:
@@ -238,6 +241,7 @@ def restart_delay(crashes_in_window: int):
 
 
 def main():
+    check_data_layout()
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     crash_times = []
     log("supervisor_started", pid=os.getpid(), python=sys.executable, module=DESKTOP_MODULE)

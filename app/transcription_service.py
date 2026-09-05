@@ -8,7 +8,10 @@ import os
 import shutil
 import subprocess
 import sys
-from app.paths import REPO_ROOT, VAD_WORKER_MODULE, WHISPER_WORKER_MODULE
+from app.paths import (
+    REPO_ROOT, VAD_WORKER_MODULE, WHISPER_WORKER_MODULE, LOG_DIR,
+    WEB_EVENT_LOG_FILE as EVENT_LOG_FILE, DEBUG_AUDIO_DIR, WEB_WORK_DIR, check_data_layout,
+)
 import tempfile
 import threading
 import time
@@ -19,12 +22,9 @@ WHISPER_DEVICE = "auto"
 WHISPER_WORKER_READY_TIMEOUT_SECONDS = 120
 WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = 180
 SAMPLE_RATE = 16000
-LOG_DIR = "transcriptions"
-EVENT_LOG_FILE = "web_event_log.txt"
 EVENT_LOG_MAX_BYTES = 5 * 1024 * 1024
 EVENT_LOG_BACKUP_COUNT = 2
 EVENT_LOG_HEADER = "timestamp | event | details\n"
-DEBUG_AUDIO_DIR = "debug_audio"
 SAVE_DEBUG_AUDIO = True
 WHISPER_LANGUAGE = None
 WHISPER_NO_SPEECH_THRESHOLD = None
@@ -33,7 +33,6 @@ VAD_MIN_SPEECH_MS = 150
 VAD_MERGE_GAP_MS = 600
 VAD_REQUEST_TIMEOUT_SECONDS = 180
 VAD_WORKER_READY_TIMEOUT_SECONDS = 30
-WEB_WORK_DIR = "web_transcription_work"
 
 
 class EventLogger:
@@ -714,6 +713,7 @@ class TranscriptionServiceConfig:
 class TranscriptionService:
     def __init__(self, base_dir: str | None = None, config: TranscriptionServiceConfig | None = None):
         self.base_dir = os.path.abspath(base_dir) if base_dir is not None else str(REPO_ROOT)
+        check_data_layout(self.base_dir)
         self.config = config or TranscriptionServiceConfig()
         self.log_dir = os.path.join(self.base_dir, LOG_DIR)
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
@@ -723,6 +723,7 @@ class TranscriptionService:
         self.whisper_worker_module = WHISPER_WORKER_MODULE
         self._pipeline_lock = threading.Lock()
 
+        os.makedirs(os.path.dirname(self.event_log_path), exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.work_dir, exist_ok=True)
         if self.config.save_debug_audio:

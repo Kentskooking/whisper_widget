@@ -1,0 +1,3 @@
+Recording backups used by the recovery pipeline will appear here.
+
+This tracked placeholder keeps the folder in Git. Generated files remain ignored.

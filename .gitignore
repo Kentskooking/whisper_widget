@@ -1,4 +1,8 @@
-# Transcriptions folder (project-specific)
+# Local generated data and recovery work
+/data/*
+/runtime/
+
+# Legacy generated locations (keep ignored during migration)
 transcriptions/
 debug_audio/
 raw_audio_backups/
@@ -78,3 +82,17 @@ CHUNKED_PIPELINE_PLAN.md
 # Environment variables
 .env
 .env.local
+
+# Keep only these directory placeholders in Git.
+!/data/transcriptions/
+/data/transcriptions/*
+!/data/transcriptions/transcriptions_will_appear_here.txt
+!/data/debug_audio/
+/data/debug_audio/*
+!/data/debug_audio/debug_audio_will_appear_here.txt
+!/data/raw_audio_backups/
+/data/raw_audio_backups/*
+!/data/raw_audio_backups/raw_audio_backups_will_appear_here.txt
+!/data/failed_recordings/
+/data/failed_recordings/*
+!/data/failed_recordings/failed_recordings_will_appear_here.txt

@@ -1,0 +1,3 @@
+Daily transcription text files will appear here.
+
+This tracked placeholder keeps the folder in Git. Generated files remain ignored.

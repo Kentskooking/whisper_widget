@@ -7,7 +7,13 @@ import wave
 import threading
 import time
 import sys
-from app.paths import REPO_ROOT, VAD_WORKER_MODULE, WHISPER_WORKER_MODULE, CLIPBOARD_WORKER_MODULE
+from app.paths import (
+    REPO_ROOT, VAD_WORKER_MODULE, WHISPER_WORKER_MODULE, CLIPBOARD_WORKER_MODULE,
+    LOG_DIR, EVENT_LOG_FILE, DEBUG_AUDIO_DIR, RAW_AUDIO_BACKUP_DIR, FAILED_AUDIO_DIR,
+    CHUNKED_TEMP_DIR, WEB_WORK_DIR, RECORDING_WORK_DIR, RUNTIME_STATE_DIR,
+    RUNTIME_LOG_DIR, WIDGET_HEARTBEAT_FILE, WIDGET_RECOVERY_FILE,
+    FATAL_PYTHON_LOG_FILE, check_data_layout,
+)
 import shutil
 import subprocess
 import json
@@ -44,14 +50,10 @@ HOTKEY = "f8"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_SIZE = 1024
-LOG_DIR = "transcriptions"
-EVENT_LOG_FILE = "event_log.txt"
 EVENT_LOG_MAX_BYTES = 5 * 1024 * 1024
 EVENT_LOG_BACKUP_COUNT = 2
 EVENT_LOG_HEADER = "timestamp | event | details\n"
-DEBUG_AUDIO_DIR = "debug_audio"
 SAVE_DEBUG_AUDIO = True
-RAW_AUDIO_BACKUP_DIR = "raw_audio_backups"
 WHISPER_LANGUAGE = None
 WHISPER_NO_SPEECH_THRESHOLD = None
 VAD_PAD_MS = 400
@@ -64,7 +66,6 @@ CHUNKED_CHUNK_SECONDS = 30.0
 CHUNKED_OVERLAP_SECONDS = 1.5
 CHUNKED_QUEUE_MAXSIZE = 0
 CHUNKED_FINALIZE_TIMEOUT_SECONDS = 60
-CHUNKED_TEMP_DIR = "chunked_transcription_work"
 CHUNKED_KEEP_TEMP_ON_SUCCESS = False
 CHUNKED_KEEP_TEMP_ON_FAILURE = True
 CHUNKED_SAVE_DEBUG_ARTIFACTS = True
@@ -79,11 +80,6 @@ WEB_SERVER_HOST = os.environ.get("WHISPER_WEB_HOST", "127.0.0.1")
 WEB_SERVER_PORT = int(os.environ.get("WHISPER_WEB_PORT", "8765"))
 WEB_SERVER_SSL_CERTFILE = os.environ.get("WHISPER_WEB_SSL_CERTFILE") or None
 WEB_SERVER_SSL_KEYFILE = os.environ.get("WHISPER_WEB_SSL_KEYFILE") or None
-WEB_WORK_DIR = "web_transcription_work"
-RUNTIME_STATE_DIR = os.path.join("sidecache", "runtime")
-WIDGET_HEARTBEAT_FILE = "widget_heartbeat.json"
-WIDGET_RECOVERY_FILE = "widget_recovery.json"
-FATAL_PYTHON_LOG_FILE = "python_fatal.log"
 CLIPBOARD_COPY_TIMEOUT_SECONDS = 1.0
 SOUND_CUE_TONES = {
     "notification": [(660, 80)],
@@ -155,7 +151,7 @@ def enable_fatal_crash_logging():
     global _fatal_log_file
 
     try:
-        runtime_dir = os.path.join(str(REPO_ROOT), RUNTIME_STATE_DIR)
+        runtime_dir = os.path.join(str(REPO_ROOT), RUNTIME_LOG_DIR)
         os.makedirs(runtime_dir, exist_ok=True)
         crash_log_path = os.path.join(runtime_dir, FATAL_PYTHON_LOG_FILE)
         _fatal_log_file = open(crash_log_path, "a", encoding="utf-8", buffering=1)
@@ -1007,6 +1003,7 @@ class ChunkCaptureSpooler:
 
 class WhisperWidget(ctk.CTk):
     def __init__(self):
+        check_data_layout()
         super().__init__()
         self.base_dir = str(REPO_ROOT)
         self.runtime_state_dir = os.path.join(self.base_dir, RUNTIME_STATE_DIR)
@@ -1020,6 +1017,11 @@ class WhisperWidget(ctk.CTk):
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.runtime_state_dir, exist_ok=True)
         self.event_log_path = os.path.join(self.base_dir, EVENT_LOG_FILE)
+        os.makedirs(os.path.dirname(self.event_log_path), exist_ok=True)
+        self.recording_work_dir = os.path.join(self.base_dir, RECORDING_WORK_DIR)
+        self.failed_audio_dir = os.path.join(self.base_dir, FAILED_AUDIO_DIR)
+        os.makedirs(self.recording_work_dir, exist_ok=True)
+        os.makedirs(self.failed_audio_dir, exist_ok=True)
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
         self.raw_audio_backup_dir = os.path.join(self.base_dir, RAW_AUDIO_BACKUP_DIR)
         self.chunked_temp_dir = os.path.join(self.base_dir, CHUNKED_TEMP_DIR)
@@ -1091,8 +1093,8 @@ class WhisperWidget(ctk.CTk):
         self.stream_lock = threading.Lock()
         self.record_thread = None
         self.sound_lock = threading.Lock()
-        self.temp_filename = os.path.join(self.base_dir, "temp_recording.wav")
-        self.temp_speech_filename = os.path.join(self.base_dir, "temp_speech_only.wav")
+        self.temp_filename = os.path.join(self.recording_work_dir, "temp_recording.wav")
+        self.temp_speech_filename = os.path.join(self.recording_work_dir, "temp_speech_only.wav")
         self.current_raw_backup_path = None
         self.chunk_spooler = None
         self.chunk_capture_chunks = []
@@ -3533,7 +3535,7 @@ class WhisperWidget(ctk.CTk):
             raw_backup_preserved = self.preserve_raw_audio_backup()
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            failed_filename = os.path.join(self.base_dir, f"failed_recording_{timestamp}.wav")
+            failed_filename = os.path.join(self.failed_audio_dir, f"failed_recording_{timestamp}.wav")
             if not raw_backup_preserved:
                 try:
                     os.rename(self.temp_filename, failed_filename)
@@ -3545,7 +3547,7 @@ class WhisperWidget(ctk.CTk):
 
             if os.path.exists(self.temp_speech_filename):
                 try:
-                    failed_speech_filename = os.path.join(self.base_dir, f"failed_speech_only_{timestamp}.wav")
+                    failed_speech_filename = os.path.join(self.failed_audio_dir, f"failed_speech_only_{timestamp}.wav")
                     os.rename(self.temp_speech_filename, failed_speech_filename)
                     self.log_event("transcription_failed_speech_saved", file=failed_speech_filename)
                 except:
@@ -3590,6 +3592,7 @@ class WhisperWidget(ctk.CTk):
         self.destroy()
 
 if __name__ == "__main__":
+    check_data_layout()
     enable_fatal_crash_logging()
     app = WhisperWidget()
     app.mainloop()
