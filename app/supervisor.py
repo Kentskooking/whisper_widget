@@ -2,17 +2,17 @@ import json
 import os
 import subprocess
 import sys
+from app.paths import REPO_ROOT, DESKTOP_MODULE
 import time
 import ctypes
 import traceback
 from datetime import datetime
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = str(REPO_ROOT)
 RUNTIME_DIR = os.path.join(BASE_DIR, "sidecache", "runtime")
 HEARTBEAT_PATH = os.path.join(RUNTIME_DIR, "widget_heartbeat.json")
 SUPERVISOR_LOG_PATH = os.path.join(RUNTIME_DIR, "supervisor_log.txt")
-CHILD_SCRIPT = os.path.join(BASE_DIR, "whisper_widget.py")
 POLL_INTERVAL_SECONDS = 1.0
 STARTUP_GRACE_SECONDS = 180.0
 HEARTBEAT_STALE_SECONDS = 45.0
@@ -223,12 +223,12 @@ def launch_child():
     env["WHISPER_WIDGET_SUPERVISED"] = "1"
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
     child = subprocess.Popen(
-        [sys.executable, CHILD_SCRIPT],
+        [sys.executable, "-u", "-m", DESKTOP_MODULE],
         cwd=BASE_DIR,
         env=env,
         creationflags=creationflags,
     )
-    log("child_started", pid=child.pid, python=sys.executable, script=CHILD_SCRIPT)
+    log("child_started", pid=child.pid, python=sys.executable, module=DESKTOP_MODULE)
     return child
 
 
@@ -240,7 +240,7 @@ def restart_delay(crashes_in_window: int):
 def main():
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     crash_times = []
-    log("supervisor_started", pid=os.getpid(), python=sys.executable, script=CHILD_SCRIPT)
+    log("supervisor_started", pid=os.getpid(), python=sys.executable, module=DESKTOP_MODULE)
 
     while True:
         remove_file(HEARTBEAT_PATH)

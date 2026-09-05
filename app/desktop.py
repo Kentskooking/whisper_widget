@@ -7,6 +7,7 @@ import wave
 import threading
 import time
 import sys
+from app.paths import REPO_ROOT, VAD_WORKER_MODULE, WHISPER_WORKER_MODULE, CLIPBOARD_WORKER_MODULE
 import shutil
 import subprocess
 import json
@@ -83,7 +84,6 @@ RUNTIME_STATE_DIR = os.path.join("sidecache", "runtime")
 WIDGET_HEARTBEAT_FILE = "widget_heartbeat.json"
 WIDGET_RECOVERY_FILE = "widget_recovery.json"
 FATAL_PYTHON_LOG_FILE = "python_fatal.log"
-CLIPBOARD_WORKER_FILE = "clipboard_worker.py"
 CLIPBOARD_COPY_TIMEOUT_SECONDS = 1.0
 SOUND_CUE_TONES = {
     "notification": [(660, 80)],
@@ -155,7 +155,7 @@ def enable_fatal_crash_logging():
     global _fatal_log_file
 
     try:
-        runtime_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), RUNTIME_STATE_DIR)
+        runtime_dir = os.path.join(str(REPO_ROOT), RUNTIME_STATE_DIR)
         os.makedirs(runtime_dir, exist_ok=True)
         crash_log_path = os.path.join(runtime_dir, FATAL_PYTHON_LOG_FILE)
         _fatal_log_file = open(crash_log_path, "a", encoding="utf-8", buffering=1)
@@ -369,8 +369,8 @@ class EventLogger:
 class PersistentVADWorkerClient:
     """Keeps Silero VAD in a separate long-lived process to avoid repeated cold starts."""
 
-    def __init__(self, worker_script_path: str, workdir: str, log_fn):
-        self.worker_script_path = worker_script_path
+    def __init__(self, worker_module: str, workdir: str, log_fn):
+        self.worker_module = worker_module
         self.workdir = workdir
         self.log_fn = log_fn
         self._lock = threading.Lock()
@@ -405,7 +405,8 @@ class PersistentVADWorkerClient:
         command = [
             sys.executable,
             "-u",
-            self.worker_script_path,
+            "-m",
+            self.worker_module,
             "--server",
         ]
         self._reset_state_locked()
@@ -623,8 +624,8 @@ class PersistentVADWorkerClient:
 class PersistentWhisperWorkerClient:
     """Keeps Whisper/PyTorch in a separate process so native crashes do not kill the UI."""
 
-    def __init__(self, worker_script_path: str, workdir: str, model_size: str, device: str, log_fn):
-        self.worker_script_path = worker_script_path
+    def __init__(self, worker_module: str, workdir: str, model_size: str, device: str, log_fn):
+        self.worker_module = worker_module
         self.workdir = workdir
         self.model_size = model_size
         self.device = device
@@ -664,7 +665,8 @@ class PersistentWhisperWorkerClient:
         command = [
             sys.executable,
             "-u",
-            self.worker_script_path,
+            "-m",
+            self.worker_module,
             "--server",
             "--model",
             self.model_size,
@@ -1006,7 +1008,7 @@ class ChunkCaptureSpooler:
 class WhisperWidget(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = str(REPO_ROOT)
         self.runtime_state_dir = os.path.join(self.base_dir, RUNTIME_STATE_DIR)
         self.runtime_heartbeat_path = os.path.join(self.runtime_state_dir, WIDGET_HEARTBEAT_FILE)
         self.runtime_recovery_path = os.path.join(self.runtime_state_dir, WIDGET_RECOVERY_FILE)
@@ -1014,7 +1016,8 @@ class WhisperWidget(ctk.CTk):
         self.runtime_state_lock = threading.Lock()
 
         # Ensure Log Directory Exists
-        os.makedirs(LOG_DIR, exist_ok=True)
+        self.log_dir = os.path.join(self.base_dir, LOG_DIR)
+        os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.runtime_state_dir, exist_ok=True)
         self.event_log_path = os.path.join(self.base_dir, EVENT_LOG_FILE)
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
@@ -1102,16 +1105,16 @@ class WhisperWidget(ctk.CTk):
         self.web_server = None
         self.startup_recovery_thread = None
         self.recovery_state = {"active": False}
-        self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
-        self.whisper_worker_path = os.path.join(self.base_dir, "whisper_transcribe_worker.py")
+        self.vad_worker_module = VAD_WORKER_MODULE
+        self.whisper_worker_module = WHISPER_WORKER_MODULE
         self.vad_client = PersistentVADWorkerClient(
-            worker_script_path=self.vad_worker_path,
-            workdir=self.base_dir,
+            worker_module=self.vad_worker_module,
+            workdir=str(REPO_ROOT),
             log_fn=self.log_event,
         )
         self.whisper_client = PersistentWhisperWorkerClient(
-            worker_script_path=self.whisper_worker_path,
-            workdir=self.base_dir,
+            worker_module=self.whisper_worker_module,
+            workdir=str(REPO_ROOT),
             model_size=MODEL_SIZE,
             device=WHISPER_DEVICE,
             log_fn=self.log_event,
@@ -1193,7 +1196,7 @@ class WhisperWidget(ctk.CTk):
             return
 
         try:
-            from widget_web_server import WhisperWidgetWebServer
+            from app.web.embedded import WhisperWidgetWebServer
 
             self.web_server = WhisperWidgetWebServer(
                 widget=self,
@@ -2010,7 +2013,7 @@ class WhisperWidget(ctk.CTk):
         try:
             date_str = datetime.now().strftime("%Y-%m-%d")
             time_str = datetime.now().strftime("%H:%M:%S")
-            filename = os.path.join(LOG_DIR, f"{date_str}.txt")
+            filename = os.path.join(self.log_dir, f"{date_str}.txt")
             
             with open(filename, "a", encoding="utf-8") as f:
                 f.write(f"[{time_str}] {text}\n")
@@ -2031,7 +2034,6 @@ class WhisperWidget(ctk.CTk):
         if not text:
             return False
 
-        worker_path = os.path.join(self.base_dir, CLIPBOARD_WORKER_FILE)
         self.log_event(
             "clipboard_copy_start",
             chars=len(text),
@@ -2040,8 +2042,8 @@ class WhisperWidget(ctk.CTk):
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
         try:
             result = subprocess.run(
-                [sys.executable, "-X", "utf8", worker_path],
-                cwd=self.base_dir,
+                [sys.executable, "-X", "utf8", "-m", CLIPBOARD_WORKER_MODULE],
+                cwd=str(REPO_ROOT),
                 input=text,
                 capture_output=True,
                 text=True,
@@ -2089,7 +2091,7 @@ class WhisperWidget(ctk.CTk):
                 "model_load_start",
                 device=WHISPER_DEVICE,
                 model=MODEL_SIZE,
-                worker=self.whisper_worker_path,
+                worker=self.whisper_worker_module,
             )
             ready_payload = self.whisper_client.ensure_ready(
                 timeout_seconds=WHISPER_WORKER_READY_TIMEOUT_SECONDS,

@@ -37,6 +37,7 @@ try {
 
     Invoke-NativeStep "syntax check" { & $pythonExe ".\tools\check_syntax.py" }
     Invoke-NativeStep "ruff check" { & $pythonExe -m ruff check --no-cache -- @pythonFiles }
+    Invoke-NativeStep "tests" { & $pythonExe -m unittest discover -s tests -v }
     Invoke-NativeStep "git diff --check" { git diff --check }
 }
 finally {

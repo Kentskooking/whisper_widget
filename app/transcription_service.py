@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+from app.paths import REPO_ROOT, VAD_WORKER_MODULE, WHISPER_WORKER_MODULE
 import tempfile
 import threading
 import time
@@ -128,8 +129,8 @@ class EventLogger:
 class PersistentVADWorkerClient:
     """Keeps Silero VAD in a separate long-lived process."""
 
-    def __init__(self, worker_script_path: str, workdir: str, log_fn):
-        self.worker_script_path = worker_script_path
+    def __init__(self, worker_module: str, workdir: str, log_fn):
+        self.worker_module = worker_module
         self.workdir = workdir
         self.log_fn = log_fn
         self._lock = threading.Lock()
@@ -164,7 +165,8 @@ class PersistentVADWorkerClient:
         command = [
             sys.executable,
             "-u",
-            self.worker_script_path,
+            "-m",
+            self.worker_module,
             "--server",
         ]
         self._reset_state_locked()
@@ -397,8 +399,8 @@ class PersistentVADWorkerClient:
 class PersistentWhisperWorkerClient:
     """Keeps Whisper/PyTorch in a separate process so native crashes do not kill the server."""
 
-    def __init__(self, worker_script_path: str, workdir: str, model_size: str, device: str, log_fn):
-        self.worker_script_path = worker_script_path
+    def __init__(self, worker_module: str, workdir: str, model_size: str, device: str, log_fn):
+        self.worker_module = worker_module
         self.workdir = workdir
         self.model_size = model_size
         self.device = device
@@ -438,7 +440,8 @@ class PersistentWhisperWorkerClient:
         command = [
             sys.executable,
             "-u",
-            self.worker_script_path,
+            "-m",
+            self.worker_module,
             "--server",
             "--model",
             self.model_size,
@@ -710,14 +713,14 @@ class TranscriptionServiceConfig:
 
 class TranscriptionService:
     def __init__(self, base_dir: str | None = None, config: TranscriptionServiceConfig | None = None):
-        self.base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = os.path.abspath(base_dir) if base_dir is not None else str(REPO_ROOT)
         self.config = config or TranscriptionServiceConfig()
         self.log_dir = os.path.join(self.base_dir, LOG_DIR)
         self.debug_audio_dir = os.path.join(self.base_dir, DEBUG_AUDIO_DIR)
         self.work_dir = os.path.join(self.base_dir, WEB_WORK_DIR)
         self.event_log_path = os.path.join(self.base_dir, EVENT_LOG_FILE)
-        self.vad_worker_path = os.path.join(self.base_dir, "vad_worker.py")
-        self.whisper_worker_path = os.path.join(self.base_dir, "whisper_transcribe_worker.py")
+        self.vad_worker_module = VAD_WORKER_MODULE
+        self.whisper_worker_module = WHISPER_WORKER_MODULE
         self._pipeline_lock = threading.Lock()
 
         os.makedirs(self.log_dir, exist_ok=True)
@@ -727,13 +730,13 @@ class TranscriptionService:
 
         self.event_logger = EventLogger(self.event_log_path)
         self.vad_client = PersistentVADWorkerClient(
-            worker_script_path=self.vad_worker_path,
-            workdir=self.base_dir,
+            worker_module=self.vad_worker_module,
+            workdir=str(REPO_ROOT),
             log_fn=self.log_event,
         )
         self.whisper_client = PersistentWhisperWorkerClient(
-            worker_script_path=self.whisper_worker_path,
-            workdir=self.base_dir,
+            worker_module=self.whisper_worker_module,
+            workdir=str(REPO_ROOT),
             model_size=self.config.model_size,
             device=self.config.whisper_device,
             log_fn=self.log_event,

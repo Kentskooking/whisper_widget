@@ -16,6 +16,7 @@ This file applies to the whole repository.
 ## What The Verifier Does
 - Runs `tools/check_syntax.py` to compile repo Python files in memory without `.pyc` side effects.
 - Runs `ruff check` against repo Python files that are not git-ignored.
+- Runs the regression checks in `tests/` with `unittest`.
 - Runs `git diff --check` for whitespace and patch hygiene.
 
 ## Reporting

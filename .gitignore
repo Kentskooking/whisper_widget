@@ -73,7 +73,6 @@ oneoff_transcribe.py
 
 # Local working plans
 CHUNKED_PIPELINE_PLAN.md
-/docs/
 .codex
 
 # Environment variables

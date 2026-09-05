@@ -1,0 +1,1 @@
+"""Whisper Widget application package."""

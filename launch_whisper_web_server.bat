@@ -20,6 +20,10 @@ echo [check] Required packages and NVIDIA CUDA...
 "%PYTHON_EXE%" -u -c "import sys, importlib.metadata as m, customtkinter, whisper, pyaudio, keyboard, torch, torchaudio, soundfile, numpy, fastapi, uvicorn, multipart; print('Whisper:', m.version('openai-whisper')); print('PyTorch:', torch.__version__); sys.exit('NVIDIA CUDA is unavailable; startup stopped') if not torch.cuda.is_available() else None; print('GPU:', torch.cuda.get_device_name(0)); torch.zeros(1, device='cuda:0').item(); sys.exit('The SoundFile audio backend is unavailable') if 'soundfile' not in torchaudio.list_audio_backends() else None"
 if errorlevel 1 goto :error
 
+echo [check] Application modules...
+"%PYTHON_EXE%" -u -c "import sys, importlib.util; import app.desktop, app.supervisor, app.transcription_service, app.web.embedded, app.workers.clipboard; modules = ('app.workers.vad', 'app.workers.transcribe', 'app.web.standalone'); missing = [name for name in modules if importlib.util.find_spec(name) is None]; sys.exit('Missing application modules: ' + ', '.join(missing)) if missing else None"
+if errorlevel 1 goto :error
+
 echo [check] Package consistency...
 "%PYTHON_EXE%" -m pip check
 if errorlevel 1 goto :error
@@ -50,9 +54,9 @@ if defined WHISPER_WEB_SSL_CERTFILE set "WHISPER_WEB_SCHEME=https"
 echo [run] Starting Whisper Web Server at %WHISPER_WEB_SCHEME%://%WHISPER_WEB_HOST%:%WHISPER_WEB_PORT% ...
 if "%WHISPER_WEB_SCHEME%"=="https" (
     echo [run] HTTPS enabled with %WHISPER_WEB_SSL_CERTFILE%
-    "%PYTHON_EXE%" -u web_server.py --host "%WHISPER_WEB_HOST%" --port "%WHISPER_WEB_PORT%" --ssl-certfile "%WHISPER_WEB_SSL_CERTFILE%" --ssl-keyfile "%WHISPER_WEB_SSL_KEYFILE%"
+    "%PYTHON_EXE%" -u -m app.web.standalone --host "%WHISPER_WEB_HOST%" --port "%WHISPER_WEB_PORT%" --ssl-certfile "%WHISPER_WEB_SSL_CERTFILE%" --ssl-keyfile "%WHISPER_WEB_SSL_KEYFILE%"
 ) else (
-    "%PYTHON_EXE%" -u web_server.py --host "%WHISPER_WEB_HOST%" --port "%WHISPER_WEB_PORT%"
+    "%PYTHON_EXE%" -u -m app.web.standalone --host "%WHISPER_WEB_HOST%" --port "%WHISPER_WEB_PORT%"
 )
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" goto :runtime_error

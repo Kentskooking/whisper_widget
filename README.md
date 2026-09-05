@@ -50,7 +50,7 @@ launch_whisper_widget.bat --check
 launch_whisper_web_server.bat --check
 ```
 
-The widget launcher starts `whisper_supervisor.py`, which still restarts crashed
+The widget launcher starts `app.supervisor`, which still restarts crashed
 or unresponsive widget processes. Each restart is printed in the console and
 recorded in `sidecache/runtime/supervisor_log.txt`; repeated crashes eventually
 stop the supervisor with a nonzero exit status.
@@ -70,7 +70,7 @@ http://127.0.0.1:8765
 
 The browser records from the device where the page is open, then sends the completed audio file to the already-running widget. Web requests use the widget's existing VAD and Whisper worker clients, so the model is not loaded a second time.
 
-Agents and applications can call the widget directly without using the browser recorder. See [Whisper Widget HTTP API](API.md) for the tailnet URL, endpoint contract, error handling, and client examples.
+Agents and applications can call the widget directly without using the browser recorder. See [Whisper Widget HTTP API](docs/API.md) for the tailnet URL, endpoint contract, error handling, and client examples.
 
 The agent API also provides `POST /api/vad` for the widget's VAD decision and timestamped speech segments without invoking Whisper transcription.
 
@@ -133,6 +133,7 @@ Run the deterministic local checks:
 That runner performs:
 - in-memory Python syntax compilation for repo `.py` files that are not git-ignored
 - `ruff check` on the same repo `.py` files with a minimal low-noise ruleset (`E9` and `F`)
+- regression checks in `tests/` for process entry points and path handling
 - `git diff --check` for whitespace and patch hygiene
 
 ### Microphone Cleanup
@@ -147,7 +148,7 @@ a virtual microphone that already applies the desired processing.
 - **M:** Toggle Mute (Disable sound feedback).
 
 ## Configuration
-You can edit the `Configuration` section at the top of `whisper_widget.py` to change:
+You can edit the `Configuration` section at the top of `app/desktop.py` to change:
 - `MODEL_SIZE` (default: `large-v3`) - The default is Whisper's multilingual large model.
 - `WHISPER_LANGUAGE` (default: `None`) - Auto-detect the spoken language; set a language code such as `en` to force one language.
 - `HOTKEY` (default: `f8`) - Change global shortcut.
@@ -173,3 +174,19 @@ large
 large-v3-turbo
 turbo
 ```
+
+## Source layout
+
+- `app/desktop.py`: desktop widget.
+- `app/supervisor.py`: widget process monitoring.
+- `app/transcription_service.py`: standalone transcription service.
+- `app/workers/`: clipboard, VAD, and Whisper subprocesses.
+- `app/web/`: embedded recorder and standalone diagnostic server.
+- `app/paths.py`: repository location and process module names.
+- `tools/`: repository verification commands.
+- `docs/`: tracked project documentation, including the HTTP API.
+- `tests/`: source layout and process entry-point checks.
+
+Run application processes as modules from the repository root, using the
+project environment; for example, `.venv\Scripts\python.exe -m app.supervisor`.
+The Windows launchers set the working directory explicitly.

@@ -20,6 +20,10 @@ echo [check] Required packages and NVIDIA CUDA...
 "%PYTHON_EXE%" -u -c "import sys, importlib.metadata as m, customtkinter, whisper, pyaudio, keyboard, torch, torchaudio, soundfile, numpy, fastapi, uvicorn, multipart; print('Whisper:', m.version('openai-whisper')); print('PyTorch:', torch.__version__); sys.exit('NVIDIA CUDA is unavailable; startup stopped') if not torch.cuda.is_available() else None; print('GPU:', torch.cuda.get_device_name(0)); torch.zeros(1, device='cuda:0').item(); sys.exit('The SoundFile audio backend is unavailable') if 'soundfile' not in torchaudio.list_audio_backends() else None"
 if errorlevel 1 goto :error
 
+echo [check] Application modules...
+"%PYTHON_EXE%" -u -c "import sys, importlib.util; import app.desktop, app.supervisor, app.transcription_service, app.web.embedded, app.workers.clipboard; modules = ('app.workers.vad', 'app.workers.transcribe', 'app.web.standalone'); missing = [name for name in modules if importlib.util.find_spec(name) is None]; sys.exit('Missing application modules: ' + ', '.join(missing)) if missing else None"
+if errorlevel 1 goto :error
+
 echo [check] Package consistency...
 "%PYTHON_EXE%" -m pip check
 if errorlevel 1 goto :error
@@ -35,7 +39,7 @@ if /i "%~1"=="--check" (
 
 echo [run] Starting Whisper Widget supervisor...
 echo [run] Supervisor restarts are reported here and in sidecache\runtime\supervisor_log.txt.
-"%PYTHON_EXE%" -u whisper_supervisor.py
+"%PYTHON_EXE%" -u -m app.supervisor
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" goto :runtime_error
 endlocal & exit /b 0

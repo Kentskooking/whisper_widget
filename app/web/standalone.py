@@ -13,7 +13,7 @@ import time
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 
-from transcription_service import TranscriptionService
+from app.transcription_service import TranscriptionService
 
 
 DEFAULT_HOST = "127.0.0.1"
