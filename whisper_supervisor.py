@@ -324,7 +324,7 @@ def main():
                             runtime_process.close()
                         return 0
                     restart_reason = "child_exit"
-                    restart_details = {"returncode": returncode, "monitored_pid": monitored_pid}
+                    restart_details = {"monitored_pid": monitored_pid}
                     break
 
                 elapsed = time.monotonic() - launch_time

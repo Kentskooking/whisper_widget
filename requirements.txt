@@ -3,6 +3,8 @@
 openai-whisper==20240930
 customtkinter==5.2.2
 pyaudio==0.2.14
+# WAV I/O backend for Silero VAD on Windows.
+soundfile==0.13.1
 keyboard==0.13.5
 torch==2.5.1+cu121
 torchaudio==2.5.1+cu121

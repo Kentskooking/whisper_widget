@@ -19,33 +19,42 @@ A standalone, always-on-top desktop widget for instant speech-to-text transcript
 - **Web Recorder MVP:** Runs a browser UI that records from the browser device microphone, uploads the completed recording, and returns the transcript from this machine.
 
 ## Setup
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   *(Note: You need FFmpeg installed and added to your system PATH)*
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and make
+FFmpeg available on your system PATH. This project uses 64-bit Python 3.11.
+The `.python-version` file records that version for uv; other projects can use
+different Python versions.
 
-2. Run the widget:
-   ```bash
-   python whisper_widget.py
-   ```
+Initialize the environment explicitly from the repository root:
+```bat
+uv venv --python 3.11 --seed .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip "setuptools<81"
+.venv\Scripts\python.exe -m pip install --no-build-isolation -r requirements.txt
+```
+`requirements.txt` is pinned to this project's CUDA 12.1 PyTorch wheels.
+Create a fresh `.venv` after moving the project to another machine.
 
-### Recommended Windows launch flow (venv isolated)
-Use the included launcher to keep this app isolated from system Python package drift:
+### Windows launch flow
 ```bat
 launch_whisper_widget.bat
 ```
-On first run it creates `.venv`, installs pinned dependencies from `requirements.txt`, then launches the app.
-`requirements.txt` is pinned to the CUDA 12.1 PyTorch wheels used by this project.
-Note: the virtual environment folder name is `.venv` (with a leading dot), not `venv`.
+Both launchers use only this repository's `.venv\Scripts\python.exe`.
+They check Python 3.11, runtime imports, package consistency, NVIDIA CUDA,
+the SoundFile audio backend, and FFmpeg before starting. A failed check prints
+its original diagnostic and exits with a nonzero status. On a normal launch,
+the console waits for a key after failure so the diagnostic remains visible.
+Setup and dependency repair are explicit commands, never automatic startup actions.
 
-If you want to install manually in the same way as the launcher:
+Run the checks without starting the app or pausing on failure:
 ```bat
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install --upgrade pip "setuptools<81"
-python -m pip install --no-build-isolation -r requirements.txt
+launch_whisper_widget.bat --check
+launch_whisper_web_server.bat --check
 ```
+
+The widget launcher starts `whisper_supervisor.py`, which still restarts crashed
+or unresponsive widget processes. Each restart is printed in the console and
+recorded in `sidecache/runtime/supervisor_log.txt`; repeated crashes eventually
+stop the supervisor with a nonzero exit status.
+The standalone web launcher rejects an incomplete HTTPS certificate/key pair.
 
 ### Embedded web recorder
 The desktop widget now starts the web recorder in the same process by default.
@@ -113,7 +122,7 @@ Then open `http://<this-machine-tailscale-ip>:8765` from the other device. This 
 ### Dev checks
 Install the dev-only verifier tooling into the same `.venv`:
 ```bat
-python -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
 Run the deterministic local checks:
