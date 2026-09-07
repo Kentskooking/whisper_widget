@@ -2,6 +2,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import ctypes
 import customtkinter as ctk
+import tkinter as tk
 import pyaudio
 import wave
 import threading
@@ -1059,7 +1060,7 @@ class WhisperWidget(ctk.CTk):
         )
         # Window Setup
         self.title("Whisper")
-        self.geometry("120x120+50+50") # Small square
+        self.geometry("120x150+50+50") # Circle plus status/copy footer
         self.resizable(False, False)
         self.attributes("-topmost", True) # Always on top
         self.overrideredirect(True) # Frameless window
@@ -1080,6 +1081,10 @@ class WhisperWidget(ctk.CTk):
         self.is_processing = False
         self.is_muted = False  # New Mute State
         self.last_ui_state = None
+        self.last_transcription_path = os.path.join(self.runtime_state_dir, "last_transcript.txt")
+        self.last_transcription_lock = threading.Lock()
+        self.manual_copy_lock = threading.Lock()
+        self.last_transcription = self.load_last_transcription()
         self.audio_frames = []
         self.ui_queue = Queue()
         self.shutdown_event = threading.Event()
@@ -1144,7 +1149,8 @@ class WhisperWidget(ctk.CTk):
         # Load Model in Background
         self.whisper_ready = False
         self.status_label = ctk.CTkLabel(self, text="Loading Model...", font=("Arial", 10))
-        self.status_label.grid(row=1, column=0, pady=(0, 5))
+        self.status_label.grid(row=1, column=0, padx=(30, 4), pady=(0, 5))
+        self.create_copy_button()
         self.update_ui_state("loading")
         self.write_runtime_heartbeat(reason="app_initialized")
         
@@ -1167,6 +1173,35 @@ class WhisperWidget(ctk.CTk):
         self.start_web_server()
         self.log_event("app_ready")
         self.write_runtime_heartbeat(reason="app_ready")
+
+    def create_copy_button(self):
+        self.copy_button = ctk.CTkFrame(self, width=26, height=24, fg_color="transparent")
+        self.copy_button.grid(row=1, column=0, sticky="sw", padx=(4, 0), pady=(0, 5))
+        self.copy_button.pack_propagate(False)
+        background = self._apply_appearance_mode(self.cget("fg_color"))
+        self.copy_icon = tk.Canvas(self.copy_button, bg=background, highlightthickness=0,
+                                   cursor="hand2")
+        self.copy_icon.pack(fill="both", expand=True)
+
+        def draw(event):
+            scale_x, scale_y = event.width / 26, event.height / 24
+            self.copy_icon.delete("paper")
+            for left, top, right, bottom in ((5, 3, 15, 16), (9, 7, 20, 20)):
+                self.copy_icon.create_rectangle(
+                    left * scale_x, top * scale_y, right * scale_x, bottom * scale_y,
+                    fill=background, outline="#aeb5bd", width=1.3 * min(scale_x, scale_y),
+                    tags="paper",
+                )
+
+        self.copy_icon.bind("<Configure>", draw)
+        self.copy_icon.bind("<Enter>", lambda _event: self.copy_icon.itemconfigure(
+            "paper", outline="#ffffff"))
+        self.copy_icon.bind("<Leave>", lambda _event: self.copy_icon.itemconfigure(
+            "paper", outline="#aeb5bd"))
+        # Stop these events before the toplevel's drag bindings see them.
+        self.copy_icon.bind("<ButtonPress-1>", self.copy_last_transcription)
+        self.copy_icon.bind("<B1-Motion>", lambda _event: "break")
+        self.copy_icon.bind("<ButtonRelease-1>", lambda _event: "break")
 
     def start_drag(self, event):
         self.x = event.x
@@ -2012,6 +2047,7 @@ class WhisperWidget(ctk.CTk):
 
     def log_transcription(self, text):
         """Appends transcription to a daily log file."""
+        self.remember_transcription(text)
         try:
             date_str = datetime.now().strftime("%Y-%m-%d")
             time_str = datetime.now().strftime("%H:%M:%S")
@@ -2030,6 +2066,52 @@ class WhisperWidget(ctk.CTk):
         print("\n[transcription]")
         print(text)
         print("[/transcription]", flush=True)
+
+    def load_last_transcription(self):
+        try:
+            with open(self.last_transcription_path, encoding="utf-8") as source:
+                return source.read()
+        except FileNotFoundError:
+            return ""
+        except Exception as error:
+            self.log_event("last_transcription_load_failed", error=error)
+            return ""
+
+    def remember_transcription(self, text):
+        if not text:
+            return
+        with self.last_transcription_lock:
+            # Keep the in-memory copy even if saving or automatic copying fails.
+            self.last_transcription = text
+            temporary_path = self.last_transcription_path + ".tmp"
+            try:
+                with open(temporary_path, "w", encoding="utf-8") as output:
+                    output.write(text)
+                os.replace(temporary_path, self.last_transcription_path)
+            except Exception as error:
+                self.log_event("last_transcription_save_failed", error=error)
+
+    def copy_last_transcription(self, _event=None):
+        if self.shutdown_event.is_set():
+            return "break"
+        with self.last_transcription_lock:
+            text = self.last_transcription
+        if not text or not self.manual_copy_lock.acquire(blocking=False):
+            return "break"
+
+        def copy():
+            try:
+                copied = self.copy_transcription_to_clipboard(text)
+                self.log_event("manual_clipboard_copy_finished", copied=copied, chars=len(text))
+            finally:
+                self.manual_copy_lock.release()
+
+        try:
+            threading.Thread(target=copy, name="manual_clipboard_copy", daemon=True).start()
+        except Exception:
+            self.manual_copy_lock.release()
+            raise
+        return "break"
 
     def copy_transcription_to_clipboard(self, text):
         """Attempt one clipboard write outside the widget process."""
