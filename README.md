@@ -76,6 +76,10 @@ Agents and applications can call the widget directly without using the browser r
 
 The agent API also provides `POST /api/vad` for the widget's VAD decision and timestamped speech segments without invoking Whisper transcription.
 
+`GET /api/transcripts/latest` returns the latest completed transcript from the
+host widget or any connected recorder. Remote copy buttons can use this shared
+history without running local inference or changing the host's clipboard.
+
 Override the bind address or port with:
 ```bat
 set WHISPER_WEB_HOST=127.0.0.1

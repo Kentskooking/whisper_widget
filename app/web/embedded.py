@@ -1426,6 +1426,17 @@ class WhisperWidgetWebServer:
         def health():
             return self.widget.web_status_payload()
 
+        @app.get("/api/transcripts/latest")
+        def latest_transcript():
+            # Desktop, uploads, and remote chunk sessions share this saved history.
+            # It remains available while another recording is in progress.
+            with self.widget.last_transcription_lock:
+                text = self.widget.last_transcription
+            return JSONResponse(
+                {"ok": True, "text": text},
+                headers={"Cache-Control": "no-store"},
+            )
+
         @app.get("/api/chunked/config")
         def chunked_config():
             return {

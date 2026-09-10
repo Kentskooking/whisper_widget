@@ -70,6 +70,26 @@ Example response:
 
 `ok` means the web application is responding. Before submitting work, inspect `busy`. `model_ready` and `vad_ready` report whether the corresponding workers are already warm; a request may start workers when needed.
 
+## Latest completed transcript
+
+### `GET /api/transcripts/latest`
+
+Returns `{"ok": true, "text": "..."}` with the most recent nonempty completed
+transcript saved by the desktop widget, a one-shot upload, or a remote chunked
+session. All clients of this widget share this history, regardless of which
+machine recorded the audio. It survives host restarts through the widget's saved
+transcript state.
+
+An empty `text` means the host has no saved transcript yet. The endpoint remains
+available while recording or processing; it returns the previous completed text,
+never partial chunks. The response uses `Cache-Control: no-store` and does not
+change any clipboard, start workers, or run inference. Like the other endpoints,
+access is controlled by the existing Tailscale boundary.
+
+Clients can call this endpoint when their copy button is clicked. A `404` means
+the host needs the API update and a widget restart. Network errors should leave
+the clipboard untouched rather than silently substitute an older cached copy.
+
 ## One-shot transcription
 
 ### `POST /api/transcribe`

@@ -1,5 +1,7 @@
 """Recovery of completed text independently of clipboard availability."""
 
+import asyncio
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -8,6 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.desktop import WhisperWidget
+from app.web.embedded import WhisperWidgetWebServer
 
 
 def history_widget(directory):
@@ -26,6 +29,43 @@ def history_widget(directory):
 
 
 class ClipboardHistoryTests(unittest.TestCase):
+    def latest_response(self, widget, directory):
+        server = WhisperWidgetWebServer(widget, "127.0.0.1", 0, directory, None, None,
+                                        widget.log_event)
+        messages = []
+
+        async def request():
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                messages.append(message)
+
+            await server.create_app()(
+                {"type": "http", "method": "GET", "path": "/api/transcripts/latest",
+                 "root_path": "", "query_string": b"", "headers": [],
+                 "scheme": "http", "http_version": "1.1"}, receive, send)
+
+        asyncio.run(request())
+        self.assertEqual(messages[0]["status"], 200)
+        self.assertIn((b"cache-control", b"no-store"), messages[0]["headers"])
+        return json.loads(b"".join(item.get("body", b"") for item in messages))
+
+    def test_latest_api_returns_completed_history_while_busy_and_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            widget = history_widget(directory)
+            self.assertEqual(self.latest_response(widget, directory), {"ok": True, "text": ""})
+            # All entry points log their finished text through this shared method.
+            for text in ("Host microphone.", "Remote microphone: café.\nSecond line."):
+                WhisperWidget.log_transcription(widget, text)
+                widget.is_recording = True
+                widget.is_processing = True
+                self.assertEqual(self.latest_response(widget, directory), {"ok": True, "text": text})
+            restarted = history_widget(directory)
+            restarted.last_transcription = WhisperWidget.load_last_transcription(restarted)
+            self.assertEqual(self.latest_response(restarted, directory)["text"], text)
+            widget.copy_transcription_to_clipboard.assert_not_called()
+
     def test_logged_text_survives_clipboard_failure_and_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             widget = history_widget(directory)
