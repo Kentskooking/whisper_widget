@@ -7,6 +7,8 @@ A standalone, always-on-top desktop widget for instant speech-to-text transcript
 - **Global Hotkey:** Press **F8** anywhere to start/stop recording.
 - **Drag & Drop:** Click and drag the widget to position it anywhere.
 - **Auto Copy:** Transcription is automatically copied to your clipboard.
+- **Copy Again:** The bottom-left copy icon copies the latest completed transcript,
+  including after restarting the widget. The footer still displays **Press F8**.
 - **Smart Transcription:**
   - **VAD First:** Uses Silero VAD on the raw recording to isolate speech before Whisper.
   - **Simple Audio Path:** Sends VAD speech-only audio directly to Whisper without in-app denoise or normalization.
@@ -64,6 +66,10 @@ The browser records from the device where the page is open, then sends the compl
 Agents and applications can call the widget directly without using the browser recorder. See [Whisper Widget HTTP API](API.md) for the tailnet URL, endpoint contract, error handling, and client examples.
 
 The agent API also provides `POST /api/vad` for the widget's VAD decision and timestamped speech segments without invoking Whisper transcription.
+
+`GET /api/transcripts/latest` returns the latest completed transcript from the
+host widget or any connected recorder. Remote copy buttons can use this shared
+history without running local inference or changing the host's clipboard.
 
 Override the bind address or port with:
 ```bat
@@ -136,6 +142,10 @@ a virtual microphone that already applies the desired processing.
 - **F8:** Toggle recording (Global Hotkey).
 - **Spacebar:** Toggle recording (When widget is focused).
 - **M:** Toggle Mute (Disable sound feedback).
+- **Copy icon (bottom left):** Copy the last completed transcript again without
+  starting/stopping recording. Works for desktop and embedded web transcripts.
+  The latest text is saved locally in `sidecache/runtime/last_transcript.txt` before
+  automatic copying, so a clipboard failure does not lose it.
 
 ## Configuration
 You can edit the `Configuration` section at the top of `whisper_widget.py` to change:

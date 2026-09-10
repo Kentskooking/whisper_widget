@@ -1241,6 +1241,9 @@ class RemoteChunkSession:
                 raise RuntimeError(f"chunk_transcription_failures={len(failed_results)}")
 
             final_text = self.widget.stitch_chunk_transcripts(ordered_results)
+            # Publish shared history before clients can observe a completed session.
+            if final_text:
+                self.widget.log_transcription(final_text)
             self.partial_text = final_text
             self.final_text = final_text
             self.final = True
@@ -1251,7 +1254,6 @@ class RemoteChunkSession:
         if final_text:
             if hasattr(self.widget, "print_transcription_to_terminal"):
                 self.widget.print_transcription_to_terminal(final_text)
-            self.widget.log_transcription(final_text)
         self.manager.log_event(
             "web_chunk_session_complete",
             session_id=self.session_id,
@@ -1425,6 +1427,17 @@ class WhisperWidgetWebServer:
         @app.get("/health")
         def health():
             return self.widget.web_status_payload()
+
+        @app.get("/api/transcripts/latest")
+        def latest_transcript():
+            # Desktop, uploads, and remote chunk sessions share this saved history.
+            # It remains available while another recording is in progress.
+            with self.widget.last_transcription_lock:
+                text = self.widget.last_transcription
+            return JSONResponse(
+                {"ok": True, "text": text},
+                headers={"Cache-Control": "no-store"},
+            )
 
         @app.get("/api/chunked/config")
         def chunked_config():
