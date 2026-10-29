@@ -17,10 +17,12 @@ import threading
 import time
 
 
-MODEL_SIZE = "large-v3"
-WHISPER_DEVICE = "auto"
-WHISPER_WORKER_READY_TIMEOUT_SECONDS = 120
-WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = 180
+from app.bark_backend import MODEL_ID
+
+MODEL_SIZE = MODEL_ID
+WHISPER_DEVICE = os.environ.get("BARK_DEVICE", "auto")
+WHISPER_WORKER_READY_TIMEOUT_SECONDS = int(os.environ.get("BARK_READY_TIMEOUT", "120"))
+WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = int(os.environ.get("BARK_TRANSCRIBE_TIMEOUT", "180"))
 SAMPLE_RATE = 16000
 EVENT_LOG_MAX_BYTES = 5 * 1024 * 1024
 EVENT_LOG_BACKUP_COUNT = 2
@@ -782,63 +784,11 @@ class TranscriptionService:
         return self.status()
 
     def base_transcribe_options(self) -> dict:
-        return {
-            "condition_on_previous_text": False,
-            "language": self.config.whisper_language,
-            "logprob_threshold": -1.0,
-            "no_speech_threshold": self.config.whisper_no_speech_threshold,
-        }
+        return {"language": self.config.whisper_language}
 
-    def build_transcribe_attempts(
-        self,
-        raw_path: str,
-        speech_path: str,
-        speech_secs: float,
-    ) -> list[dict]:
-        base_options = self.base_transcribe_options()
-        attempt_candidates = []
-
-        if speech_secs > 0.0 and os.path.exists(speech_path):
-            attempt_candidates.append(("speech_only_primary", speech_path, {}))
-
-        attempt_candidates.append(("raw_full_fallback", raw_path, {}))
-        attempt_candidates.append(
-            (
-                "raw_full_permissive",
-                raw_path,
-                {
-                    "compression_ratio_threshold": None,
-                    "logprob_threshold": None,
-                    "no_speech_threshold": None,
-                },
-            )
-        )
-
-        attempts = []
-        seen = set()
-        for label, path, overrides in attempt_candidates:
-            if not path or not os.path.exists(path):
-                continue
-
-            signature = (
-                os.path.abspath(path),
-                tuple(sorted((key, repr(value)) for key, value in overrides.items())),
-            )
-            if signature in seen:
-                continue
-
-            seen.add(signature)
-            options = dict(base_options)
-            options.update(overrides)
-            attempts.append(
-                {
-                    "label": label,
-                    "path": path,
-                    "options": options,
-                }
-            )
-
-        return attempts
+    def build_transcribe_attempts(self, raw_path, speech_path=None, speech_secs=None) -> list[dict]:
+        return [{"label": label, "path": raw_path, "options": self.base_transcribe_options()}
+                for label in ("original_audio", "original_audio_retry")]
 
     def log_transcription(self, text: str):
         try:
@@ -896,7 +846,7 @@ class TranscriptionService:
         text = ""
         success = False
         error_text = None
-        speech_secs = 0.0
+        speech_secs = None
 
         with self._pipeline_lock:
             self.log_event(
@@ -909,33 +859,8 @@ class TranscriptionService:
                 shutil.copy2(wav_path, raw_path)
                 self.log_event("web_transcription_source_staged", request_id=request_id, file=raw_path)
 
-                vad_started = time.perf_counter()
-                try:
-                    speech_secs = self.vad_client.run(
-                        in_wav_path=raw_path,
-                        out_wav_path=speech_path,
-                        sample_rate=self.config.sample_rate,
-                        pad_ms=VAD_PAD_MS,
-                        min_speech_ms=VAD_MIN_SPEECH_MS,
-                        merge_gap_ms=VAD_MERGE_GAP_MS,
-                        speech_prob_threshold=0.5,
-                    )
-                    timings["vad_seconds"] = time.perf_counter() - vad_started
-                    self.log_event(
-                        "web_vad_complete",
-                        request_id=request_id,
-                        speech_secs=f"{speech_secs:.3f}",
-                        processing_seconds=f"{timings['vad_seconds']:.3f}",
-                    )
-                except Exception as e:
-                    timings["vad_seconds"] = time.perf_counter() - vad_started
-                    speech_secs = -1.0
-                    self.log_event("web_vad_failed_fallback_raw", request_id=request_id, error=e)
-
-                if speech_secs == 0.0:
-                    self.log_event("web_vad_no_speech_detected", request_id=request_id)
-                elif speech_secs > 0.0:
-                    self.log_event("web_vad_speech_source_ready", request_id=request_id, file=speech_path)
+                # Preserve every sample. VAD is separate from Bark preprocessing.
+                self.log_event("web_audio_preserved", request_id=request_id, silence_trimmed=False)
 
                 debug_dir = self.save_debug_audio_files(raw_path, speech_path, request_id)
                 attempts = self.build_transcribe_attempts(raw_path, speech_path, speech_secs)

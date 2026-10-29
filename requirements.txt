@@ -1,14 +1,18 @@
---extra-index-url https://download.pytorch.org/whl/cu121
-
-openai-whisper==20240930
-customtkinter==5.2.2
-pyaudio==0.2.14
-# WAV I/O backend for Silero VAD on Windows.
-soundfile==0.13.1
-keyboard==0.13.5
-torch==2.5.1+cu121
-torchaudio==2.5.1+cu121
-numpy==1.26.4
-fastapi==0.115.6
-uvicorn[standard]==0.32.1
-python-multipart==0.0.17
+# Python 3.11+. Install the PyTorch build appropriate for your hardware first.
+# No CUDA wheel index or GPU model is selected by this file.
+torch>=2.8,<3
+# Buffered decoding uses Parakeet cache internals from this release family.
+transformers>=5.19,<5.20
+huggingface-hub>=2.2,<3
+numpy>=1.26,<3
+librosa>=0.11,<0.12
+soundfile>=0.13,<1
+soxr>=0.5,<2
+silero-vad>=6,<7
+customtkinter>=5.2,<6
+pyaudio>=0.2.14,<0.3
+keyboard>=0.13.5,<0.14
+fastapi>=0.115.6,<1
+uvicorn[standard]>=0.32.1,<1
+python-multipart>=0.0.18,<1
+packaging>=23

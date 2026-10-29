@@ -1,211 +1,195 @@
-# Whisper Widget
+# Bark Widget
 
-A standalone, always-on-top desktop widget for instant speech-to-text transcription using OpenAI's Whisper model.
+A compact Windows speech-to-text widget using
+[ConwayResearch/Underdog-Bark-3.0-Pro](https://huggingface.co/ConwayResearch/Underdog-Bark-3.0-Pro).
+This branch retains the Whisper widget's interface and HTTP API while replacing
+recognition with Bark Pro, an **English ASR model** based on Parakeet TDT.
+It is unrelated to Suno's Bark speech generator.
 
 ## Features
-- **Always-on-top Widget:** Minimalistic UI that floats over other windows.
-- **Global Hotkey:** Press **F8** anywhere to start/stop recording.
-- **Drag & Drop:** Click and drag the widget to position it anywhere.
-- **Auto Copy:** Transcription is automatically copied to your clipboard.
-- **Copy Again:** The bottom-left copy icon copies the latest completed transcript,
-  including after restarting the widget. The footer still displays **Press F8**.
-- **Smart Transcription:**
-  - **VAD First:** Uses Silero VAD on the raw recording to isolate speech before Whisper.
-  - **Simple Audio Path:** Sends VAD speech-only audio directly to Whisper without in-app denoise or normalization.
-  - **Progressive Fallbacks:** Falls back to raw full-audio transcription attempts if needed.
-- **Transcription Logs:** Saves daily transcription logs to the `data/transcriptions/` folder.
-- **Debug Audio Capture:** Saves `raw.wav` and `speech_only.wav` in timestamped folders under `data/debug_audio/` for comparison and model testing.
-- **Runtime Event Logs:** Writes runtime diagnostics to `runtime/logs/event_log.txt` without storing transcription text.
-  - The active log rotates at 5 MB and retains `event_log.1.txt` and `event_log.2.txt`.
-  - On Windows the active log and rotated archives are marked hidden. View them with `Get-Content -Force .\runtime\logs\event_log.txt`.
-- **Web Recorder MVP:** Runs a browser UI that records from the browser device microphone, uploads the completed recording, and returns the transcript from this machine.
 
-## Setup
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and make
-FFmpeg available on your system PATH. This project uses 64-bit Python 3.11.
-The `.python-version` file records that version for uv; other projects can use
-different Python versions.
+- Always-on-top, draggable widget with the existing recording/status controls.
+- **F8** globally or **Space** while focused to start/stop recording.
+- **M** to mute sound cues; automatic clipboard delivery and a copy-again button.
+- Latest completed transcript survives restarts and is shared with web clients.
+- Buffered transcription while recording, with original pauses and quiet speech preserved.
+- Recording recovery, failed-audio retention, debug audio, daily transcripts,
+  rotating diagnostic logs, and the existing process supervisor.
+- Embedded browser recorder, file uploads, chunked sessions, and separate VAD analysis.
+- Configurable PyTorch device; no GPU model, UUID, or workstation path is required.
 
-Initialize the environment explicitly from the repository root:
-```bat
-uv venv --python 3.11 --seed .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip "setuptools<81"
-.venv\Scripts\python.exe -m pip install --no-build-isolation -r requirements.txt
-```
-`requirements.txt` is pinned to this project's CUDA 12.1 PyTorch wheels.
-Create a fresh `.venv` after moving the project to another machine.
+## Requirements
 
-### Windows launch flow
-```bat
-launch_whisper_widget.bat
-```
-Both launchers use only this repository's `.venv\Scripts\python.exe`.
-They check Python 3.11, runtime imports, package consistency, NVIDIA CUDA,
-the SoundFile audio backend, and FFmpeg before starting. A failed check prints
-its original diagnostic and exits with a nonzero status. On a normal launch,
-the console waits for a key after failure so the diagnostic remains visible.
-Setup and dependency repair are explicit commands, never automatic startup actions.
+- Windows with 64-bit **Python 3.11 or later** and Tk support.
+  Choose a Python release supported by the wheels you install.
+- A compatible PyTorch installation. A CUDA-capable build/device is selected
+  automatically when available; otherwise the backend uses CPU float32.
+  CPU transcription can be substantially slower.
+- [FFmpeg](https://ffmpeg.org/download.html) on PATH for uploaded media conversion.
+- A working microphone for desktop recording.
+- Disk space for the model (about 1.3 GB of weights), dependencies, and recordings.
 
-Run the checks without starting the app or pausing on failure:
-```bat
-launch_whisper_widget.bat --check
-launch_whisper_web_server.bat --check
+This is a Windows desktop application. Hardware support follows the selected
+PyTorch build; there is no claim that every GPU/backend works. The device options
+implemented here are `auto`, `cpu`, `cuda`, and `cuda:N`.
+
+## Install
+
+Clone this branch and open PowerShell in the repository root. Create a local
+environment using the Python installation you chose; replace the example path:
+
+```powershell
+& "C:\Path\To\Python\python.exe" -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
 ```
 
-The widget launcher starts `app.supervisor`, which still restarts crashed
-or unresponsive widget processes. Each restart is printed in the console and
-recorded in `runtime/logs/supervisor_log.txt`; repeated crashes eventually
-stop the supervisor with a nonzero exit status.
-The standalone web launcher rejects an incomplete HTTPS certificate/key pair.
+Choose the appropriate PyTorch build using the
+[official installation selector](https://pytorch.org/get-started/locally/).
+Run its installation command through `.\.venv\Scripts\python.exe -m pip`
+instead of a global `pip`. Then install the application dependencies:
 
-### Embedded web recorder
-The desktop widget now starts the web recorder in the same process by default.
-Use the normal widget launcher:
-```bat
-launch_whisper_widget.bat
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m app.download_models
 ```
 
-By default the embedded web server binds to `127.0.0.1:8765`:
+The download command obtains Bark Pro from Hugging Face into the normal user
+cache. It does not start inference, recording, or a server. Silero VAD's weights
+are included with its Python package. Runtime workers load local files only.
+For an existing/offline model, set `BARK_MODEL_DIR` instead of downloading again.
+
+Dependencies use compatibility ranges, with no CUDA wheel index or Python patch
+version forced by this repository. Transformers is limited to the **5.19 release
+family** because the buffered decoder uses its Parakeet cache interfaces.
+Broadening that range requires checking those interfaces and the decoder tests.
+There is no workstation-specific lock file.
+
+## Run
+
+```powershell
+.\launch_whisper_widget.bat
+```
+
+The existing launcher name is retained. It validates the environment, then starts
+the supervisor and the same compact widget, now labeled Bark. Wait for READY,
+record with F8, and paste after COPIED. If clipboard delivery fails, the completed
+text remains saved and available through the copy button.
+
+Check startup requirements without opening a window or loading model weights:
+
+```powershell
+.\launch_whisper_widget.bat --check
+```
+
+Launchers use this checkout's `.venv\Scripts\python.exe`. They never install
+packages, download models, or repair environments automatically. Close another
+widget using F8 before starting; a hotkey conflict is reported rather than sharing
+a recording shortcut between instances. The launcher also prevents a second Bark
+widget instance.
+
+## Device and model configuration
+
+Set variables in the shell that launches the widget, or in your own wrapper.
+The application does not require or read a `.env` file.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BARK_DEVICE` | `auto` | First visible CUDA device, otherwise CPU; or explicitly `cpu` / `cuda:N`. |
+| `BARK_DTYPE` | `auto` | Native CUDA BF16 when supported, otherwise float32. Explicit CUDA float16/BF16 or float32 is also available. |
+| `BARK_MODEL_DIR` | Unset | Local directory containing the Bark model, processor, tokenizer, and generation files. |
+| `BARK_MODEL_REVISION` | `4b5c51e04aa8d16dda9ecdff71bc29f7360149e4` | Snapshot of the same Bark checkpoint used by download/cache lookup. |
+| `HF_HOME` | Hugging Face default | Optional model cache location. |
+| `CUDA_VISIBLE_DEVICES` | Inherited | Optional device visibility control; device indices follow this setting. |
+| `BARK_CPU_THREADS` | `2` | PyTorch CPU thread count in the recognition worker. |
+| `BARK_READY_TIMEOUT` | `120` | Worker startup timeout in seconds. |
+| `BARK_TRANSCRIBE_TIMEOUT` | `180` | Per-request inference timeout in seconds. |
+| `BARK_FINALIZE_TIMEOUT` | `180` | Desktop queue completion timeout in seconds. |
+
+For example:
+
+```powershell
+$env:BARK_DEVICE = "cuda:1"
+$env:BARK_MODEL_DIR = "D:\Models\Underdog-Bark-3.0-Pro"
+.\launch_whisper_widget.bat
+```
+
+Use `BARK_DEVICE=cpu` to select CPU explicitly. Increase transcription and
+finalization timeouts together if slower hardware needs more time. Selecting a
+missing device fails with a diagnostic. The application does not choose a GPU by
+name, reserve hardware, or change other applications' GPU allocations.
+
+## Audio behavior
+
+The microphone records mono 16 kHz PCM16. Silero runs on CPU to find pauses; it
+does **not** remove silence before transcription. Capture seeks a confirmed pause
+near 30 seconds, with a bounded fallback at 40 seconds. Forced cuts retain the
+original 1.5-second overlap for recovery.
+
+Bark decodes at most 10 seconds of new audio per internal window, with up to
+10 seconds of left context and 5 seconds of right context. Decoder state carries
+through the recording, and overlapping context is never emitted twice.
+Stopping flushes available audio immediately without waiting for future silence
+or context. Finished text comes from the accumulated tokens, preserving spoken
+repetitions. Long-file requests and recovery use an independent bounded decoder.
+
+Bark Pro is English-only. Capitalization, punctuation, and wording can differ
+from Whisper or whole-recording inference. No punctuation repair, repetition
+filter, denoise, or gain processing is added. Configure microphone cleanup
+upstream through your Windows input device if desired.
+
+## Browser recorder and API
+
+The desktop widget starts the embedded server at:
+
 ```text
 http://127.0.0.1:8765
 ```
 
-The browser records from the device where the page is open, then sends the completed audio file to the already-running widget. Web requests use the widget's existing VAD and Whisper worker clients, so the model is not loaded a second time.
+It shares the desktop workers and completed transcript history. Existing routes
+and `WHISPER_*` web configuration names remain compatible:
 
-Agents and applications can call the widget directly without using the browser recorder. See [Whisper Widget HTTP API](docs/API.md) for the tailnet URL, endpoint contract, error handling, and client examples.
+- `WHISPER_WIDGET_WEB_ENABLED=0` disables the embedded server.
+- `WHISPER_WEB_HOST` and `WHISPER_WEB_PORT` change the bind address and port.
+- `WHISPER_WEB_SSL_CERTFILE` and `WHISPER_WEB_SSL_KEYFILE` must be set together.
 
-The agent API also provides `POST /api/vad` for the widget's VAD decision and timestamped speech segments without invoking Whisper transcription.
+See [the API contract](docs/API.md) for uploads, chunk sessions, latest transcript,
+VAD analysis, and busy/error handling. A remote browser needs HTTPS for microphone
+access; use your own private HTTPS proxy or Tailscale Serve configuration.
+The API has no built-in authentication: keep the default loopback binding or
+provide your own access boundary before enabling remote access.
 
-`GET /api/transcripts/latest` returns the latest completed transcript from the
-host widget or any connected recorder. Remote copy buttons can use this shared
-history without running local inference or changing the host's clipboard.
+`launch_whisper_web_server.bat` retains the separate diagnostic browser/file
+upload server. It loads its own worker and offers `/`, `/health`, and
+`/api/transcribe`; the full chunked/history/VAD API belongs to the desktop's
+embedded server. Do not run both on the same port.
 
-Override the bind address or port with:
-```bat
-set WHISPER_WEB_HOST=127.0.0.1
-set WHISPER_WEB_PORT=8765
-launch_whisper_widget.bat
-```
+## Storage and recovery
 
-Disable the embedded web server with:
-```bat
-set WHISPER_WIDGET_WEB_ENABLED=0
-launch_whisper_widget.bat
-```
+Audio and transcript output remains under `data/`; logs, pending recordings,
+and recovery state remain under `runtime/`. Preserve those directories when
+changing versions. See [storage.md](docs/storage.md) for paths and migration.
 
-`launch_whisper_web_server.bat` still exists as a standalone diagnostic server, but it owns a separate Whisper worker and should not be used for the normal widget-backed web flow.
+Remote session status is persisted under `runtime/work/web/session_state/`.
+Interrupted sessions report failure after restart and retain received audio.
+Decoder caches are never guessed or restored after worker loss: recovery uses
+the original recording. Cancelled sessions keep the pipeline occupied until
+in-flight work stops, then release decoder state.
 
-For another Tailscale device, expose the local server through Tailscale Serve HTTPS so browser microphone and clipboard APIs run in a secure context:
-```bat
-tailscale serve --bg 8765
-tailscale serve status
-```
+## Development
 
-Then open the HTTPS Tailscale Serve URL shown by `tailscale serve status`.
+Install the optional developer requirements and run the repository verifier:
 
-If Tailscale Serve is not available, run the web server directly with a Tailscale certificate:
-```bat
-mkdir sidecache\certs
-tailscale cert --cert-file sidecache\certs\<machine-fqdn>.crt --key-file sidecache\certs\<machine-fqdn>.key <machine-fqdn>
-set WHISPER_WEB_HOST=0.0.0.0
-set WHISPER_WEB_PORT=8765
-set WHISPER_WEB_SSL_CERTFILE=sidecache\certs\<machine-fqdn>.crt
-set WHISPER_WEB_SSL_KEYFILE=sidecache\certs\<machine-fqdn>.key
-launch_whisper_widget.bat
-```
-
-Then open `https://<machine-fqdn>:8765` from the other device.
-
-For direct tailnet-IP connectivity testing without Tailscale Serve, bind the server to all interfaces:
-```bat
-set WHISPER_WEB_HOST=0.0.0.0
-set WHISPER_WEB_PORT=8765
-launch_whisper_widget.bat
-```
-
-Then open `http://<this-machine-tailscale-ip>:8765` from the other device. This proves network reachability, but browser microphone access may still be blocked because raw tailnet IP HTTP is not a secure context. If it times out while localhost works, check that Windows Firewall allows inbound TCP traffic on the selected port.
-
-### Dev checks
-Install the dev-only verifier tooling into the same `.venv`:
-```bat
-.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-```
-
-Run the deterministic local checks:
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\tools\check_all.ps1
 ```
 
-That runner performs:
-- in-memory Python syntax compilation for repo `.py` files that are not git-ignored
-- `ruff check` on the same repo `.py` files with a minimal low-noise ruleset (`E9` and `F`)
-- regression checks in `tests/` for process entry points and path handling
-- `git diff --check` for whitespace and patch hygiene
+It checks in-memory syntax compilation, Ruff, regression tests, and Git patch
+hygiene. Tests include sample continuity, buffered state/retries, recovery,
+clipboard history, and process entry points. Model-backed/microphone acceptance
+is separate from those regression checks.
 
-### Microphone Cleanup
-The app does not run its own denoise or normalization stages. Configure any
-microphone cleanup upstream at the Windows input-device level, such as selecting
-a virtual microphone that already applies the desired processing.
-
-## Controls
-- **Click & Drag:** Move the widget.
-- **F8:** Toggle recording (Global Hotkey).
-- **Spacebar:** Toggle recording (When widget is focused).
-- **M:** Toggle Mute (Disable sound feedback).
-- **Copy icon (bottom left):** Copy the last completed transcript again without
-  starting/stopping recording. Works for desktop and embedded web transcripts.
-  The latest text is saved locally in `runtime/state/last_transcript.txt` before
-  automatic copying, so a clipboard failure does not lose it.
-
-## Configuration
-You can edit the `Configuration` section at the top of `app/desktop.py` to change:
-- `MODEL_SIZE` (default: `large-v3`) - The default is Whisper's multilingual large model.
-- `WHISPER_LANGUAGE` (default: `None`) - Auto-detect the spoken language; set a language code such as `en` to force one language.
-- `HOTKEY` (default: `f8`) - Change global shortcut.
-- `CUDA_VISIBLE_DEVICES` - Adjust GPU targeting if you have multiple GPUs.
-- `SAVE_DEBUG_AUDIO` - Keep or disable timestamped debug audio capture under `data/debug_audio/`.
-- `EVENT_LOG_MAX_BYTES`, `EVENT_LOG_BACKUP_COUNT` - Control event log rotation size and retained archives.
-
-Valid `MODEL_SIZE` values from the installed `openai-whisper` package:
-
-```text
-tiny.en
-tiny
-base.en
-base
-small.en
-small
-medium.en
-medium
-large-v1
-large-v2
-large-v3
-large
-large-v3-turbo
-turbo
-```
-
-## Source layout
-
-- `app/desktop.py`: desktop widget.
-- `app/supervisor.py`: widget process monitoring.
-- `app/transcription_service.py`: standalone transcription service.
-- `app/workers/`: clipboard, VAD, and Whisper subprocesses.
-- `app/web/`: embedded recorder and standalone diagnostic server.
-- `app/paths.py`: repository location, generated-data paths, and process module names.
-- `tools/`: repository verification and explicit data migration commands.
-- `docs/`: tracked project documentation, including the HTTP API.
-- `tests/`: source layout and process entry-point checks.
-
-Run application processes as modules from the repository root, using the
-project environment; for example, `.venv\Scripts\python.exe -m app.supervisor`.
-The Windows launchers set the working directory explicitly.
-
-## Generated files
-
-Saved transcripts and audio live under `data/`; logs, recovery state, and
-processing files live under `runtime/`. Generated contents are ignored by Git;
-named text placeholders keep the `data/` subfolders in fresh checkouts.
-Recovery state and work files can contain unfinished recordings, so preserve them
-together. See [storage locations and migration](docs/storage.md) for the full
-layout, retention behavior, and the explicit migration command for older checkouts.
+See [implementation notes](docs/bark-port.md) for the source port and validation
+scope. Model weights and generated recordings are excluded from Git. The model
+has its own license and attribution requirements; retain its downloaded
+`NOTICE` and consult the linked model card when redistributing model assets.

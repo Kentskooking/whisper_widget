@@ -7,7 +7,6 @@ import time
 import traceback
 import warnings
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -23,67 +22,20 @@ def redirect_library_stdout():
         yield
 
 
-def resolve_device(requested_device: str, torch_module):
-    requested_device = (requested_device or "auto").strip().lower()
-    if requested_device != "auto":
-        return requested_device
-
-    if not torch_module.cuda.is_available():
-        return "cpu"
-
-    # Preserve the app's historical preference for cuda:1 when two GPUs are visible.
-    return "cuda:1" if torch_module.cuda.device_count() > 1 else "cuda:0"
-
-
 def load_worker_model(model_size: str, requested_device: str):
-    import torch
-    import whisper
-
-    device = resolve_device(requested_device, torch)
-    use_cuda = str(device).startswith("cuda")
-    load_device = "cpu" if use_cuda else device
+    from app.bark_backend import BarkEngine
     started = time.perf_counter()
     with redirect_library_stdout():
-        model = whisper.load_model(model_size, device=load_device)
-    if use_cuda:
-        model = model.half().to(device)
-        for module in model.modules():
-            if isinstance(module, torch.nn.LayerNorm):
-                module.float()
-        torch.cuda.empty_cache()
-    model_dtype = str(next(model.parameters()).dtype)
-    layer_norm_dtype = next(
-        (
-            str(next(module.parameters()).dtype)
-            for module in model.modules()
-            if isinstance(module, torch.nn.LayerNorm)
-        ),
-        None,
-    )
+        model = BarkEngine(model_size, requested_device)
+    torch = model.torch
     cuda_memory = {}
-    if use_cuda:
-        device_index = torch.device(device).index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
+    if model.device.startswith("cuda"):
         cuda_memory = {
-            "cuda_allocated_mb": round(
-                torch.cuda.memory_allocated(device_index) / 1024 / 1024,
-                1,
-            ),
-            "cuda_reserved_mb": round(
-                torch.cuda.memory_reserved(device_index) / 1024 / 1024,
-                1,
-            ),
+            "cuda_allocated_mb": round(torch.cuda.memory_allocated(model.device) / 1024 / 1024, 1),
+            "cuda_reserved_mb": round(torch.cuda.memory_reserved(model.device) / 1024 / 1024, 1),
+            "gpu_name": torch.cuda.get_device_name(model.device),
         }
-    return (
-        model,
-        device,
-        load_device,
-        model_dtype,
-        layer_norm_dtype,
-        cuda_memory,
-        time.perf_counter() - started,
-    )
+    return model, model.device, model.device, str(model.dtype), None, cuda_memory, time.perf_counter() - started
 
 
 def run_server(args) -> int:
@@ -139,6 +91,10 @@ def run_server(args) -> int:
             return 0
 
         request_id = request.get("request_id")
+        if request_type == "reset_stream":
+            model.reset_stream()
+            emit_message({"type": "response", "request_id": request_id, "ok": True})
+            continue
         if request_type != "transcribe":
             emit_message({
                 "type": "response",
@@ -161,6 +117,7 @@ def run_server(args) -> int:
                 "ok": True,
                 "text": (result.get("text") or "").strip(),
                 "elapsed_seconds": elapsed,
+                **({"buffered": result["buffered"]} if "buffered" in result else {}),
             })
         except Exception as e:
             emit_message({
@@ -177,8 +134,9 @@ def run_server(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", action="store_true")
-    parser.add_argument("--model", default="large-v3")
-    parser.add_argument("--device", default="auto")
+    from app.bark_backend import MODEL_ID
+    parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument("--device", default=os.environ.get("BARK_DEVICE", "auto"))
     args = parser.parse_args()
 
     if not args.server:

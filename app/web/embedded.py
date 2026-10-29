@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
 import os
-from queue import Queue
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
-import uuid
-import wave
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
+from app.web.audio import convert_to_wav, save_upload
+from app.web.sessions import RemoteChunkSessionManager
 
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
@@ -25,7 +22,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Whisper Widget Web</title>
+  <title>Bark Widget Web</title>
   <style>
     :root {
       color-scheme: dark;
@@ -160,7 +157,7 @@ INDEX_HTML = """<!doctype html>
 <body>
   <main>
     <header>
-      <h1>Whisper Widget Web</h1>
+      <h1>Bark Widget Web</h1>
       <div id="status" class="status">Checking widget</div>
     </header>
     <section class="toolbar" aria-label="Recorder controls">
@@ -943,443 +940,6 @@ INDEX_HTML = """<!doctype html>
 """
 
 
-def safe_upload_suffix(filename: str | None) -> str:
-    suffix = Path(filename or "").suffix.lower()
-    if not suffix or len(suffix) > 12:
-        return ".webm"
-    allowed = set(".abcdefghijklmnopqrstuvwxyz0123456789")
-    if any(char not in allowed for char in suffix):
-        return ".webm"
-    return suffix
-
-
-def save_upload(upload: UploadFile, output_dir: str) -> tuple[str, int]:
-    suffix = safe_upload_suffix(upload.filename)
-    output_path = os.path.join(output_dir, f"upload{suffix}")
-    total_bytes = 0
-    with open(output_path, "wb") as output:
-        while True:
-            chunk = upload.file.read(UPLOAD_CHUNK_BYTES)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > MAX_UPLOAD_BYTES:
-                raise ValueError("Upload is too large")
-            output.write(chunk)
-
-    if total_bytes == 0:
-        raise ValueError("Upload is empty")
-
-    return output_path, total_bytes
-
-
-def convert_to_wav(input_path: str, output_path: str) -> float:
-    started = time.perf_counter()
-    command = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        input_path,
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-sample_fmt",
-        "s16",
-        output_path,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=CONVERT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except FileNotFoundError as e:
-        raise RuntimeError("ffmpeg was not found on PATH") from e
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"ffmpeg timed out after {CONVERT_TIMEOUT_SECONDS}s") from e
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()[-1200:]
-        raise RuntimeError(f"ffmpeg conversion failed: {stderr or completed.returncode}")
-
-    return time.perf_counter() - started
-
-
-def validate_chunk_wav(path: str, sample_rate: int, channels: int, sample_width: int, frames: int):
-    with wave.open(path, "rb") as reader:
-        actual_channels = reader.getnchannels()
-        actual_sample_width = reader.getsampwidth()
-        actual_sample_rate = reader.getframerate()
-        actual_frames = reader.getnframes()
-
-    if actual_channels != channels:
-        raise ValueError(f"Chunk channel mismatch: expected {channels}, got {actual_channels}")
-    if actual_sample_width != sample_width:
-        raise ValueError(
-            f"Chunk sample width mismatch: expected {sample_width}, got {actual_sample_width}"
-        )
-    if actual_sample_rate != sample_rate:
-        raise ValueError(f"Chunk sample rate mismatch: expected {sample_rate}, got {actual_sample_rate}")
-    if actual_frames != frames:
-        raise ValueError(f"Chunk frame mismatch: expected {frames}, got {actual_frames}")
-
-
-def save_chunk_upload(upload: UploadFile, output_path: str) -> int:
-    total_bytes = 0
-    with open(output_path, "wb") as output:
-        while True:
-            chunk = upload.file.read(UPLOAD_CHUNK_BYTES)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > MAX_UPLOAD_BYTES:
-                raise ValueError("Chunk upload is too large")
-            output.write(chunk)
-
-    if total_bytes == 0:
-        raise ValueError("Chunk upload is empty")
-
-    return total_bytes
-
-
-class RemoteChunkSession:
-    def __init__(self, manager, session_id: str, session_dir: str, config: dict):
-        self.manager = manager
-        self.widget = manager.widget
-        self.session_id = session_id
-        self.session_dir = session_dir
-        self.config = dict(config)
-        self.queue = Queue()
-        self.lock = threading.Lock()
-        self.thread = threading.Thread(
-            target=self._worker_loop,
-            daemon=True,
-            name=f"web_chunk_session_{session_id[:8]}",
-        )
-        self.created_at = time.time()
-        self.updated_at = self.created_at
-        self.status = "recording"
-        self.error = None
-        self.next_expected_index = 0
-        self.chunks_received = 0
-        self.chunks_transcribed = 0
-        self.final_chunk_seen = False
-        self.final = False
-        self.manager_finished = False
-        self.partial_text = ""
-        self.final_text = ""
-        self.results = {}
-        self.received_chunks = {}
-        os.makedirs(self.session_dir, exist_ok=True)
-
-    def start(self):
-        self.thread.start()
-
-    def status_payload(self):
-        with self.lock:
-            return {
-                "ok": self.error is None,
-                "session_id": self.session_id,
-                "status": self.status,
-                "error": self.error,
-                "chunks_received": self.chunks_received,
-                "chunks_transcribed": self.chunks_transcribed,
-                "partial_text": self.partial_text,
-                "final_text": self.final_text,
-                "final": self.final,
-                "config": dict(self.config),
-            }
-
-    def enqueue_chunk(
-        self,
-        chunk_index: int,
-        start_sample: int,
-        end_sample: int,
-        is_final: bool,
-        upload: UploadFile,
-    ):
-        sample_count = end_sample - start_sample
-        if sample_count <= 0:
-            raise ValueError("Chunk end_sample must be greater than start_sample")
-
-        with self.lock:
-            if self.status not in ("recording", "processing"):
-                raise ValueError(f"Session is not accepting chunks: {self.status}")
-            if self.final_chunk_seen:
-                raise ValueError("Final chunk has already been received")
-            if chunk_index != self.next_expected_index:
-                raise ValueError(
-                    f"Unexpected chunk index {chunk_index}; expected {self.next_expected_index}"
-                )
-
-            filename = f"chunk_{chunk_index:04d}_{start_sample:010d}_{end_sample:010d}.wav"
-            chunk_path = os.path.join(self.session_dir, filename)
-
-        upload_bytes = save_chunk_upload(upload, chunk_path)
-        validate_chunk_wav(
-            chunk_path,
-            sample_rate=int(self.config["sample_rate"]),
-            channels=int(self.config["channels"]),
-            sample_width=int(self.config["sample_width"]),
-            frames=sample_count,
-        )
-
-        chunk = {
-            "index": chunk_index,
-            "path": chunk_path,
-            "start_sample": start_sample,
-            "end_sample": end_sample,
-            "seconds": sample_count / float(self.config["sample_rate"]),
-            "is_final": bool(is_final),
-        }
-
-        with self.lock:
-            self.next_expected_index += 1
-            self.chunks_received += 1
-            self.received_chunks[chunk_index] = chunk
-            self.updated_at = time.time()
-            self.status = "processing"
-            if is_final:
-                self.final_chunk_seen = True
-
-        self.manager.log_event(
-            "web_chunk_received",
-            session_id=self.session_id,
-            chunk_index=chunk_index,
-            start_sample=start_sample,
-            end_sample=end_sample,
-            final=is_final,
-            bytes=upload_bytes,
-            file=chunk_path,
-        )
-        self.queue.put(chunk)
-        return self.status_payload()
-
-    def finish(self):
-        should_queue_finish = False
-        with self.lock:
-            if not self.final and not self.final_chunk_seen:
-                if self.status not in ("recording", "processing"):
-                    raise ValueError(f"Session cannot finish from state: {self.status}")
-                self.final_chunk_seen = True
-                self.status = "processing"
-                self.updated_at = time.time()
-                should_queue_finish = True
-
-        if should_queue_finish:
-            self.manager.log_event(
-                "web_chunk_session_finish_requested",
-                session_id=self.session_id,
-                chunks_received=self.chunks_received,
-            )
-            self.queue.put({"finish": True})
-        return self.status_payload()
-
-    def cancel(self, reason: str = "cancelled"):
-        should_cancel = False
-        with self.lock:
-            if not self.final:
-                self.status = "cancelled"
-                self.error = reason
-                self.updated_at = time.time()
-                should_cancel = True
-        if should_cancel:
-            self.queue.put(None)
-            self.manager.finish_session(self, success=False, reason=reason)
-        return self.status_payload()
-
-    def _worker_loop(self):
-        try:
-            while True:
-                chunk = self.queue.get()
-                try:
-                    if chunk is None:
-                        return
-                    if chunk.get("finish"):
-                        self._complete_success()
-                        return
-                    self._process_chunk(chunk)
-                    if chunk.get("is_final"):
-                        self._complete_success()
-                        return
-                finally:
-                    self.queue.task_done()
-        except Exception as e:
-            self._complete_failure(str(e))
-
-    def _process_chunk(self, chunk):
-        chunk_index = chunk.get("index")
-        result = self.widget.process_and_transcribe_chunk(chunk)
-        with self.lock:
-            self.results[chunk_index] = result
-            self.chunks_transcribed = len(self.results)
-            ordered_results = [self.results[index] for index in sorted(self.results)]
-            self.partial_text = self.widget.stitch_chunk_transcripts(ordered_results)
-            self.updated_at = time.time()
-
-        self.manager.log_event(
-            "web_chunk_transcribed",
-            session_id=self.session_id,
-            chunk_index=chunk_index,
-            ok=result.get("ok"),
-            chars=len(result.get("text") or ""),
-            final=chunk.get("is_final"),
-        )
-
-    def _complete_success(self):
-        with self.lock:
-            ordered_results = [self.results[index] for index in sorted(self.results)]
-            failed_results = [result for result in ordered_results if not result.get("ok")]
-            if failed_results:
-                raise RuntimeError(f"chunk_transcription_failures={len(failed_results)}")
-
-            final_text = self.widget.stitch_chunk_transcripts(ordered_results)
-            self.partial_text = final_text
-            self.final_text = final_text
-            self.final = True
-            self.status = "complete"
-            self.updated_at = time.time()
-
-        self.widget.write_chunk_transcript_debug(ordered_results, final_text, reason="web_success")
-        if final_text:
-            if hasattr(self.widget, "print_transcription_to_terminal"):
-                self.widget.print_transcription_to_terminal(final_text)
-            self.widget.log_transcription(final_text)
-        self.manager.log_event(
-            "web_chunk_session_complete",
-            session_id=self.session_id,
-            chunks=len(ordered_results),
-            chars=len(final_text),
-        )
-        self.manager.finish_session(self, success=True, reason="complete")
-
-    def _complete_failure(self, error: str):
-        with self.lock:
-            ordered_results = [self.results[index] for index in sorted(self.results)]
-            self.status = "failed"
-            self.error = error
-            self.final = True
-            self.updated_at = time.time()
-
-        self.widget.write_chunk_transcript_debug(ordered_results, "", reason="web_failure")
-        self.manager.log_event(
-            "web_chunk_session_failed",
-            session_id=self.session_id,
-            error=error,
-        )
-        self.manager.finish_session(self, success=False, reason="failure")
-
-
-class RemoteChunkSessionManager:
-    def __init__(self, widget, work_dir: str, log_fn):
-        self.widget = widget
-        self.work_dir = work_dir
-        self.log_fn = log_fn
-        self.lock = threading.Lock()
-        self.sessions = {}
-        self.active_session_id = None
-        os.makedirs(self.work_dir, exist_ok=True)
-
-    def log_event(self, event, **fields):
-        try:
-            self.log_fn(event, **fields)
-        except Exception:
-            pass
-
-    def chunk_config(self):
-        return self.widget.web_chunk_config_payload()
-
-    def start_session(self):
-        with self.lock:
-            if self.active_session_id:
-                active = self.sessions.get(self.active_session_id)
-                if active and active.status in ("recording", "processing"):
-                    raise RuntimeError("Another chunked web session is already active")
-
-            if self.widget.is_recording or self.widget.is_processing:
-                raise RuntimeError("Widget is busy recording or processing")
-
-            if not self.widget.web_pipeline_lock.acquire(blocking=False):
-                raise RuntimeError("Widget web pipeline is busy")
-
-            try:
-                session_id = datetime_session_id()
-                session_dir = os.path.join(self.work_dir, "chunked_sessions", session_id)
-                session = RemoteChunkSession(
-                    manager=self,
-                    session_id=session_id,
-                    session_dir=session_dir,
-                    config=self.chunk_config(),
-                )
-                self.sessions[session_id] = session
-                self.active_session_id = session_id
-            except Exception:
-                self.widget.web_pipeline_lock.release()
-                raise
-
-        self.widget.is_processing = True
-        self.widget.ui_call(self.widget.update_ui_state, "processing")
-        self.widget.write_runtime_heartbeat(reason="web_chunk_session_start")
-        session.start()
-        self.log_event("web_chunk_session_started", session_id=session_id, dir=session_dir)
-        return session.status_payload()
-
-    def get_session(self, session_id: str):
-        with self.lock:
-            session = self.sessions.get(session_id)
-        if session is None:
-            raise KeyError(session_id)
-        return session
-
-    def finish_session(self, session: RemoteChunkSession, success: bool, reason: str):
-        cleanup_dir = session.session_dir
-        with self.lock:
-            if session.manager_finished:
-                return
-            session.manager_finished = True
-            if self.active_session_id == session.session_id:
-                self.active_session_id = None
-
-        try:
-            if success:
-                shutil.rmtree(cleanup_dir)
-                self.log_event(
-                    "web_chunk_session_temp_removed",
-                    session_id=session.session_id,
-                    dir=cleanup_dir,
-                )
-            else:
-                self.log_event(
-                    "web_chunk_session_temp_preserved",
-                    session_id=session.session_id,
-                    dir=cleanup_dir,
-                    reason=reason,
-                )
-        except Exception as e:
-            self.log_event(
-                "web_chunk_session_temp_cleanup_failed",
-                session_id=session.session_id,
-                dir=cleanup_dir,
-                error=e,
-            )
-
-        self.widget.ui_call(self.widget.finish_processing)
-        try:
-            self.widget.web_pipeline_lock.release()
-        except RuntimeError:
-            pass
-
-
-def datetime_session_id():
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    return f"{timestamp}_{uuid.uuid4().hex[:8]}"
 
 
 class WhisperWidgetWebServer:
@@ -1403,7 +963,7 @@ class WhisperWidgetWebServer:
         self.server = None
         self.thread = None
         self.chunk_sessions = RemoteChunkSessionManager(
-            widget=self.widget,
+            backend=self.widget,
             work_dir=self.work_dir,
             log_fn=self.log_fn,
         )
@@ -1416,7 +976,7 @@ class WhisperWidgetWebServer:
             pass
 
     def create_app(self):
-        app = FastAPI(title="Whisper Widget Web")
+        app = FastAPI(title="Bark Widget Web")
 
         @app.get("/", response_class=HTMLResponse)
         def index():
@@ -1718,6 +1278,7 @@ class WhisperWidgetWebServer:
         self.log_event("web_widget_server_start_requested", host=self.host, port=self.port)
 
     def stop(self):
+        self.chunk_sessions.close()
         if self.server is not None:
             self.server.should_exit = True
         if self.thread is not None and self.thread.is_alive():

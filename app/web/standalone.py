@@ -34,7 +34,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Whisper Web</title>
+  <title>Bark Web</title>
   <style>
     :root {
       color-scheme: dark;
@@ -186,7 +186,7 @@ INDEX_HTML = """<!doctype html>
 <body>
   <main>
     <header>
-      <h1>Whisper Web</h1>
+      <h1>Bark Web</h1>
       <div id="status" class="status">Checking server</div>
     </header>
     <section class="toolbar" aria-label="Recorder controls">
@@ -420,7 +420,7 @@ async def lifespan(app_instance: FastAPI):
         service.close()
 
 
-app = FastAPI(title="Whisper Web", lifespan=lifespan)
+app = FastAPI(title="Bark Web", lifespan=lifespan)
 
 
 def safe_upload_suffix(filename: str | None) -> str:
@@ -554,7 +554,7 @@ def transcribe(audio: UploadFile = File(...)):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run the Whisper web server.")
+    parser = argparse.ArgumentParser(description="Run the Bark web server.")
     parser.add_argument("--host", default=os.environ.get("WHISPER_WEB_HOST", DEFAULT_HOST))
     parser.add_argument(
         "--port",
@@ -566,7 +566,7 @@ def parse_args():
     parser.add_argument(
         "--preload",
         action="store_true",
-        help="Start the Whisper and VAD workers during server startup.",
+        help="Start the Bark and VAD workers during server startup.",
     )
     return parser.parse_args()
 

@@ -1,4 +1,5 @@
 import argparse
+import base64
 import contextlib
 import json
 import os
@@ -8,7 +9,6 @@ import traceback
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import torch
-import torchaudio  # noqa: F401
 
 
 _silero_model = None
@@ -30,13 +30,28 @@ def load_silero_vad():
     global _silero_model, _silero_utils
     if _silero_model is None or _silero_utils is None:
         with redirect_library_stdout():
-            _silero_model, _silero_utils = torch.hub.load(
-                repo_or_dir="snakers4/silero-vad",
-                model="silero_vad",
-                trust_repo=True,
-            )
+            from silero_vad import load_silero_vad as load_model, get_speech_timestamps, collect_chunks
+            _silero_model = load_model(onnx=False)
+            _silero_utils = (get_speech_timestamps, save_audio, read_audio, None, collect_chunks)
         _silero_model.to("cpu")
     return _silero_model, _silero_utils
+
+
+def read_audio(path, sampling_rate=16000):
+    import soundfile as sf
+    import soxr
+
+    audio, rate = sf.read(path, dtype="float32", always_2d=True)
+    audio = audio.mean(axis=1)
+    if rate != sampling_rate:
+        audio = soxr.resample(audio, rate, sampling_rate)
+    return torch.from_numpy(audio.copy())
+
+
+def save_audio(path, audio, sampling_rate=16000):
+    import soundfile as sf
+
+    sf.write(path, audio.detach().cpu().numpy(), sampling_rate, subtype="PCM_16")
 
 
 def vad_analyze_and_extract(
@@ -120,6 +135,31 @@ def vad_extract_speech_only(
     return float(result["speech_secs"])
 
 
+def find_confirmed_pauses(pcm: bytes, sample_rate: int) -> dict:
+    """Return unpadded silence spans, without changing the extraction settings.
+
+    Retain even very short detected speech so a short word cannot be discarded
+    just to manufacture an apparent pause. Each call resets Silero's state.
+    """
+    if sample_rate != 16000 or not pcm or len(pcm) % 2:
+        raise ValueError("Pause analysis requires nonempty mono PCM16 at 16 kHz")
+    model, utils = load_silero_vad()
+    wav = torch.frombuffer(bytearray(pcm), dtype=torch.int16).float() / 32768.0
+    speech = utils[0](
+        wav, model, sampling_rate=sample_rate, threshold=0.5,
+        min_speech_duration_ms=0, min_silence_duration_ms=100, speech_pad_ms=0,
+    )
+    pauses = []
+    end = 0
+    for segment in speech:
+        if segment["start"] > end:
+            pauses.append({"start": end, "end": segment["start"]})
+        end = segment["end"]
+    if end < len(wav):
+        pauses.append({"start": end, "end": len(wav)})
+    return {"pauses": pauses}
+
+
 def write_result(result_file: str, payload: dict):
     with open(result_file, "w", encoding="utf-8") as f:
         json.dump(payload, f)
@@ -188,7 +228,7 @@ def run_server() -> int:
             return 0
 
         request_id = request.get("request_id")
-        if request_type != "run":
+        if request_type not in ("run", "pauses"):
             emit_message(
                 {
                     "type": "response",
@@ -201,15 +241,21 @@ def run_server() -> int:
 
         try:
             with redirect_library_stdout():
-                result = vad_analyze_and_extract(
-                    in_wav_path=request["input"],
-                    out_wav_path=request["output"],
-                    sample_rate=int(request["sample_rate"]),
-                    pad_ms=int(request["pad_ms"]),
-                    min_speech_ms=int(request["min_speech_ms"]),
-                    merge_gap_ms=int(request["merge_gap_ms"]),
-                    speech_prob_threshold=float(request["threshold"]),
-                )
+                if request_type == "pauses":
+                    result = find_confirmed_pauses(
+                        base64.b64decode(request["pcm16"], validate=True),
+                        int(request["sample_rate"]),
+                    )
+                else:
+                    result = vad_analyze_and_extract(
+                        in_wav_path=request["input"],
+                        out_wav_path=request["output"],
+                        sample_rate=int(request["sample_rate"]),
+                        pad_ms=int(request["pad_ms"]),
+                        min_speech_ms=int(request["min_speech_ms"]),
+                        merge_gap_ms=int(request["merge_gap_ms"]),
+                        speech_prob_threshold=float(request["threshold"]),
+                    )
             emit_message(
                 {
                     "type": "response",

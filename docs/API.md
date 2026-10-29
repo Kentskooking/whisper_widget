@@ -1,24 +1,16 @@
-# Whisper Widget HTTP API
+# Bark Widget HTTP API
 
-This document is for agents and applications that need transcription without using the browser recorder. The API is served by the running desktop Whisper widget and is reachable from devices permitted by the tailnet policy.
+This document describes the full API served by the desktop widget's embedded
+server. The standalone diagnostic server offers only the browser/file upload
+subset (`/`, `/health`, and `/api/transcribe`).
 
 ## Connection details
 
-Current tailnet base URL:
-
-```text
-https://whisper-host-tail64165-ts-net.tail913055.ts.net
-```
-
-Local base URL on the Whisper host:
-
-```text
-http://127.0.0.1:8765
-```
-
-The tailnet URL is provided by Tailscale Serve and currently proxies to the local widget. A client must be connected to the same tailnet and allowed by its Tailscale ACLs/grants.
-
-The application does not currently implement API keys, bearer tokens, or per-client authorization. Tailscale is the access boundary. Do not expose this service publicly without adding an authentication layer.
+The default base URL is `http://127.0.0.1:8765`. All examples below target that
+local address. Replace it with your own private HTTPS URL for remote clients.
+There is no built-in authentication; use an access-controlled proxy or private
+network such as Tailscale before allowing remote access. Remote browser
+microphone/clipboard use requires a secure context (HTTPS).
 
 Live API descriptions are available at:
 
@@ -38,7 +30,7 @@ For a complete audio file, use the one-shot endpoint:
 
 Use the chunked API only when audio must be uploaded and transcribed incrementally.
 
-Use `POST /api/vad` when a client needs the service's speech/no-speech decision without running Whisper. This endpoint uses the same VAD worker and settings as the transcription pipeline.
+Use `POST /api/vad` when a client needs the service's speech/no-speech decision without running Bark. This uses the separate VAD analysis operation. Transcription preserves all original samples; pause detection only selects chunk boundaries.
 
 ## Health and availability
 
@@ -48,7 +40,7 @@ Returns the widget and worker state.
 
 ```bash
 curl --fail-with-body \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/health
+  http://127.0.0.1:8765/health
 ```
 
 Example response:
@@ -61,8 +53,8 @@ Example response:
   "busy": false,
   "recording": false,
   "processing": false,
-  "model": "large-v3",
-  "device": "cuda:1",
+  "model": "ConwayResearch/Underdog-Bark-3.0-Pro",
+  "device": "cuda:0",
   "worker_pid": 28216,
   "launcher_pid": 9680
 }
@@ -84,7 +76,7 @@ An empty `text` means the host has no saved transcript yet. The endpoint remains
 available while recording or processing; it returns the previous completed text,
 never partial chunks. The response uses `Cache-Control: no-store` and does not
 change any clipboard, start workers, or run inference. Like the other endpoints,
-access is controlled by the existing Tailscale boundary.
+access follows the host/proxy configuration.
 
 Clients can call this endpoint when their copy button is clicked. A `404` means
 the host needs the API update and a widget restart. Network errors should leave
@@ -100,7 +92,7 @@ Send a `multipart/form-data` request with one required field:
 | --- | --- | --- |
 | `audio` | File | Audio or a media container containing audio. |
 
-The upload limit is 200 MiB. The server uses `ffmpeg` to convert the input to 16 kHz, mono, signed 16-bit WAV before VAD and Whisper processing. Common formats supported by the installed `ffmpeg`, including WAV, MP3, M4A, FLAC, OGG, and WebM/Opus, can be submitted.
+The upload limit is 200 MiB. The server uses `ffmpeg` to convert the input to 16 kHz, mono, signed 16-bit WAV before Bark processing, preserving silence. Common formats supported by the installed `ffmpeg`, including WAV, MP3, M4A, FLAC, OGG, and WebM/Opus, can be submitted.
 
 The endpoint is synchronous. Use a client timeout of at least 10 minutes unless the caller has stricter requirements.
 
@@ -110,7 +102,7 @@ The endpoint is synchronous. Use a client timeout of at least 10 minutes unless 
 curl --fail-with-body \
   --max-time 600 \
   -F "audio=@recording.wav" \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/transcribe
+  http://127.0.0.1:8765/api/transcribe
 ```
 
 ### Python
@@ -120,14 +112,14 @@ from pathlib import Path
 
 import requests
 
-BASE_URL = "https://whisper-host-tail64165-ts-net.tail913055.ts.net"
+BASE_URL = "http://127.0.0.1:8765"
 AUDIO_PATH = Path("recording.wav")
 
 health = requests.get(f"{BASE_URL}/health", timeout=10)
 health.raise_for_status()
 state = health.json()
 if state.get("busy"):
-    raise RuntimeError("Whisper widget is busy; retry later")
+    raise RuntimeError("Bark widget is busy; retry later")
 
 with AUDIO_PATH.open("rb") as audio_file:
     response = requests.post(
@@ -140,11 +132,11 @@ try:
     payload = response.json()
 except requests.exceptions.JSONDecodeError as exc:
     raise RuntimeError(
-        f"Whisper returned HTTP {response.status_code} with a non-JSON body"
+        f"Bark returned HTTP {response.status_code} with a non-JSON body"
     ) from exc
 
 if response.status_code == 409 and payload.get("busy"):
-    raise RuntimeError("Whisper widget became busy; retry later")
+    raise RuntimeError("Bark widget became busy; retry later")
 
 response.raise_for_status()
 if not payload.get("ok"):
@@ -159,9 +151,8 @@ print(payload.get("text", ""))
 {
   "ok": true,
   "text": "The transcription appears here.",
-  "speech_secs": 8.4,
+  "speech_secs": null,
   "timings": {
-    "vad_seconds": 0.18,
     "whisper_seconds": 2.03,
     "total_seconds": 2.25,
     "convert_seconds": 0.04
@@ -169,7 +160,7 @@ print(payload.get("text", ""))
   "attempts": [
     {
       "attempt": 1,
-      "stage": "speech_only",
+      "stage": "original_audio",
       "ok": true,
       "text_chars": 31,
       "seconds": 2.03
@@ -187,9 +178,9 @@ Response fields useful to most clients are:
 | --- | --- |
 | `ok` | Whether the pipeline completed successfully. |
 | `text` | Final transcript; it may be empty. |
-| `speech_secs` | Speech duration detected by VAD. A negative value indicates VAD failed and raw-audio fallback was used. |
-| `timings` | Server-side phase durations in seconds. |
-| `attempts` | Whisper retry/fallback attempt summaries. |
+| `speech_secs` | `null` for transcription: speech duration is not measured or extracted. `/api/vad` still returns a numeric duration. |
+| `timings` | Server-side durations in seconds. `whisper_seconds` is retained as the compatibility name for Bark inference time. |
+| `attempts` | Bark retry/fallback attempt summaries. |
 | `request_id` | Identifier to correlate the request with host logs. |
 | `error` | Failure description, present when applicable. |
 | `busy` | Present and true when the shared widget pipeline is occupied. |
@@ -200,7 +191,7 @@ Clients should tolerate additional response fields.
 
 ### `POST /api/vad`
 
-This endpoint runs the service's existing Silero VAD without invoking Whisper. It is intended for remote preflight gates that need a stronger decision than a cheap local silence check.
+This endpoint runs the service's existing Silero VAD without invoking Bark. It is intended for remote preflight gates that need a stronger decision than a cheap local silence check.
 
 Send one `audio` file in `multipart/form-data`, just as for one-shot transcription. The same 200 MiB upload limit and `ffmpeg` input-format support apply.
 
@@ -208,7 +199,7 @@ Send one `audio` file in `multipart/form-data`, just as for one-shot transcripti
 curl --fail-with-body \
   --max-time 240 \
   -F "audio=@recording.wav" \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/vad
+  http://127.0.0.1:8765/api/vad
 ```
 
 Example speech response:
@@ -257,7 +248,7 @@ The optional `segments` array contains the padded and merged ranges selected by 
 Decision rules for clients:
 
 - Trust `speech_detected` only when the HTTP request succeeds and `ok` is `true`.
-- `speech_detected: false` is a successful VAD decision. Whisper is not invoked by `/api/vad`, including for no-speech responses.
+- `speech_detected: false` is a successful VAD decision. Bark is not invoked by `/api/vad`, including for no-speech responses.
 - `speech_detected: null` accompanies a busy or failed request and is not a no-speech decision.
 - `speech_secs` is the selected duration after the service's padding and merging rules, not the original file duration.
 - VAD-only failures are returned to the caller without the transcription pipeline's raw-audio fallback, so failure cannot be mistaken for silence.
@@ -276,6 +267,20 @@ Recommended robust gate:
 The chunked API is intended for long-running or live capture. It accepts sequential PCM WAV chunks, transcribes them in the background, and exposes partial and final stitched text by polling.
 
 Only one chunked session can be active at a time. It also shares the widget pipeline with desktop recording and one-shot API calls.
+The server reconstructs a continuous original PCM timeline from declared overlap.
+Overlapped samples must match exactly; gaps or changed overlap fail the session.
+Transport uploads remain roughly 30 seconds; internal pause boundaries and
+10-second decoder cores do not change the upload contract. Audio is never
+speech-trimmed. `partial_text` comes from cumulative tokens, without guessed word
+deduplication. `chunks_transcribed` counts fully decoded transport ranges, not
+internal windows. Right context may arrive with the next upload; it is not a
+fixed latency guarantee. Finish flushes the available tail immediately.
+
+Session statuses survive restart. An interrupted recording is marked failed and
+its received audio is retained; re-upload a saved original recording rather than
+continuing a lost decoder cache. A buffered inference failure can recover from
+the reconstructed original audio at completion. Successful final transcripts
+continue to update the widget's shared history.
 
 ### 1. Read the required audio configuration
 
@@ -283,7 +288,7 @@ Only one chunked session can be active at a time. It also shares the widget pipe
 
 ```bash
 curl --fail-with-body \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/chunked/config
+  http://127.0.0.1:8765/api/chunked/config
 ```
 
 Current response:
@@ -313,7 +318,7 @@ The request has no body.
 
 ```bash
 curl --fail-with-body -X POST \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/chunked/start
+  http://127.0.0.1:8765/api/chunked/start
 ```
 
 The response includes a `session_id`, current status, and the session configuration:
@@ -368,7 +373,7 @@ curl --fail-with-body \
   -F "end_sample=480000" \
   -F "is_final=false" \
   -F "audio=@chunk_0000.wav;type=audio/wav" \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/chunked/SESSION_ID/chunks
+  http://127.0.0.1:8765/api/chunked/SESSION_ID/chunks
 ```
 
 The response is the current session status. Upload chunks sequentially; do not issue parallel chunk uploads.
@@ -381,7 +386,7 @@ After the last upload, request completion:
 
 ```bash
 curl --fail-with-body -X POST \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/chunked/SESSION_ID/finish
+  http://127.0.0.1:8765/api/chunked/SESSION_ID/finish
 ```
 
 Alternatively, upload the last chunk with `is_final=true`. In either case, poll once per second:
@@ -390,10 +395,10 @@ Alternatively, upload the last chunk with `is_final=true`. In either case, poll 
 
 ```bash
 curl --fail-with-body \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/chunked/SESSION_ID
+  http://127.0.0.1:8765/api/chunked/SESSION_ID
 ```
 
-While work is in progress, `partial_text` contains the best currently stitched transcript. Stop polling when `final` becomes `true`. A successful terminal response has `status: "complete"` and the transcript in `final_text`. Terminal failure states are `failed` and `cancelled`; inspect `error`.
+While work is in progress, `partial_text` contains the current cumulative decoder transcript. Stop polling when `final` becomes `true`. A successful terminal response has `status: "complete"` and the transcript in `final_text`. Terminal failure states are `failed` and `cancelled`; inspect `error`.
 
 ### Cancel a session
 
@@ -401,10 +406,10 @@ While work is in progress, `partial_text` contains the best currently stitched t
 
 ```bash
 curl --fail-with-body -X DELETE \
-  https://whisper-host-tail64165-ts-net.tail913055.ts.net/api/chunked/SESSION_ID
+  http://127.0.0.1:8765/api/chunked/SESSION_ID
 ```
 
-Agents should cancel a session they abandon so the shared pipeline is released promptly.
+Cancel abandoned sessions. Cancellation is requested immediately, but the shared pipeline remains busy until in-flight inference stops and decoder state is released. Poll for `final: true` and wait for `/health` to report `busy: false` before starting another recording.
 
 ## HTTP errors and retry policy
 
@@ -421,7 +426,7 @@ Use bounded retries. A suggested busy retry schedule is approximately 2, 4, 8, 1
 
 ## Integration checklist
 
-- Connect the agent host to the tailnet and confirm the base URL resolves.
+- Configure the host or private HTTPS route and confirm the base URL resolves.
 - Verify `GET /health` before sending audio.
 - Send multipart form data; do not JSON-encode audio.
 - Use `/api/vad` for the service-quality speech gate, `/api/transcribe` for existing files, and `/api/chunked/*` only for incremental capture.

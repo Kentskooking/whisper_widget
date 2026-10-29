@@ -1,5 +1,8 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+import base64
+from app.chunking import BackgroundChunkCapture, PauseBoundaryPolicy
+from app.bark_backend import MODEL_ID, configure_environment
+configure_environment()
 import ctypes
 import customtkinter as ctk
 import tkinter as tk
@@ -43,10 +46,10 @@ except Exception:
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Configuration
-MODEL_SIZE = "large-v3"
-WHISPER_DEVICE = "auto"
-WHISPER_WORKER_READY_TIMEOUT_SECONDS = 120
-WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = 180
+MODEL_SIZE = MODEL_ID
+WHISPER_DEVICE = os.environ.get("BARK_DEVICE", "auto")
+WHISPER_WORKER_READY_TIMEOUT_SECONDS = int(os.environ.get("BARK_READY_TIMEOUT", "120"))
+WHISPER_TRANSCRIBE_TIMEOUT_SECONDS = int(os.environ.get("BARK_TRANSCRIBE_TIMEOUT", "180"))
 HOTKEY = "f8"
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -66,7 +69,7 @@ CHUNKED_TRANSCRIPTION_ENABLED = True
 CHUNKED_CHUNK_SECONDS = 30.0
 CHUNKED_OVERLAP_SECONDS = 1.5
 CHUNKED_QUEUE_MAXSIZE = 0
-CHUNKED_FINALIZE_TIMEOUT_SECONDS = 60
+CHUNKED_FINALIZE_TIMEOUT_SECONDS = int(os.environ.get("BARK_FINALIZE_TIMEOUT", "180"))
 CHUNKED_KEEP_TEMP_ON_SUCCESS = False
 CHUNKED_KEEP_TEMP_ON_FAILURE = True
 CHUNKED_SAVE_DEBUG_ARTIFACTS = True
@@ -371,6 +374,9 @@ class PersistentVADWorkerClient:
         self.workdir = workdir
         self.log_fn = log_fn
         self._lock = threading.Lock()
+        # Capture boundary analysis and speech extraction share this worker.
+        # Serialize whole round trips so callers cannot consume each other's replies.
+        self._request_lock = threading.Lock()
         self._process = None
         self._stdout_thread = None
         self._stderr_thread = None
@@ -378,6 +384,7 @@ class PersistentVADWorkerClient:
         self._ready_event = threading.Event()
         self._ready = False
         self._last_start_error = None
+        self._closed = False
         self._request_id = 0
 
     def _log(self, event, **fields):
@@ -399,6 +406,8 @@ class PersistentVADWorkerClient:
         self._last_start_error = None
 
     def _start_locked(self):
+        if self._closed:
+            raise RuntimeError("Widget worker is closed")
         command = [
             sys.executable,
             "-u",
@@ -479,6 +488,8 @@ class PersistentVADWorkerClient:
 
     def ensure_ready(self, timeout_seconds: int = VAD_WORKER_READY_TIMEOUT_SECONDS):
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Widget worker is closed")
             process = self._process
             if process is None or process.poll() is not None:
                 self._start_locked()
@@ -512,7 +523,38 @@ class PersistentVADWorkerClient:
         timeout_seconds: int = VAD_REQUEST_TIMEOUT_SECONDS,
         return_details: bool = False,
     ) -> float | dict:
-        self.ensure_ready()
+        message = self._request({
+            "type": "run",
+            "input": os.path.abspath(in_wav_path),
+            "output": os.path.abspath(out_wav_path),
+            "sample_rate": sample_rate,
+            "pad_ms": pad_ms,
+            "min_speech_ms": min_speech_ms,
+            "merge_gap_ms": merge_gap_ms,
+            "threshold": speech_prob_threshold,
+        }, timeout_seconds)
+        speech_secs = float(message["speech_secs"])
+        if return_details:
+            return {"speech_secs": speech_secs, "segments": list(message.get("segments") or [])}
+        return speech_secs
+
+    def find_pauses(self, pcm: bytes, sample_rate: int):
+        return self._request({
+            "type": "pauses",
+            "pcm16": base64.b64encode(pcm).decode("ascii"),
+            "sample_rate": sample_rate,
+        }, timeout_seconds=3)["pauses"]
+
+    def _request(self, request, timeout_seconds):
+        if not self._request_lock.acquire(timeout=min(timeout_seconds, 3)):
+            raise TimeoutError("VAD worker is busy")
+        try:
+            return self._request_serialized(request, timeout_seconds)
+        finally:
+            self._request_lock.release()
+
+    def _request_serialized(self, request, timeout_seconds):
+        self.ensure_ready(timeout_seconds=min(timeout_seconds, VAD_WORKER_READY_TIMEOUT_SECONDS))
 
         with self._lock:
             process = self._process
@@ -522,17 +564,7 @@ class PersistentVADWorkerClient:
             self._request_id += 1
             request_id = self._request_id
             response_queue = self._response_queue
-            request = {
-                "type": "run",
-                "request_id": request_id,
-                "input": os.path.abspath(in_wav_path),
-                "output": os.path.abspath(out_wav_path),
-                "sample_rate": sample_rate,
-                "pad_ms": pad_ms,
-                "min_speech_ms": min_speech_ms,
-                "merge_gap_ms": merge_gap_ms,
-                "threshold": speech_prob_threshold,
-            }
+            request = {**request, "request_id": request_id}
             try:
                 process.stdin.write(json.dumps(request) + "\n")
                 process.stdin.flush()
@@ -550,7 +582,7 @@ class PersistentVADWorkerClient:
                 raise RuntimeError(f"VAD worker timed out after {timeout_seconds}s")
 
             try:
-                message = response_queue.get(timeout=remaining)
+                message = response_queue.get(timeout=min(remaining, 0.2))
             except Empty:
                 with self._lock:
                     process_alive = self._is_current_process(process) and process.poll() is None
@@ -570,13 +602,7 @@ class PersistentVADWorkerClient:
                 error_text = message.get("error") or "VAD worker reported an unknown error"
                 raise RuntimeError(error_text)
 
-            speech_secs = float(message["speech_secs"])
-            if return_details:
-                return {
-                    "speech_secs": speech_secs,
-                    "segments": list(message.get("segments") or []),
-                }
-            return speech_secs
+            return message
 
     def _terminate_locked(self, process, reason: str):
         if process is None:
@@ -599,8 +625,12 @@ class PersistentVADWorkerClient:
 
         if process.poll() is None:
             try:
-                process.terminate()
-                process.wait(timeout=2.0)
+                if os.name == "nt":
+                    from app.bark_runtime import stop_owned_process
+                    stop_owned_process(process)
+                else:
+                    process.terminate()
+                    process.wait(timeout=2.0)
             except Exception:
                 pass
 
@@ -614,12 +644,13 @@ class PersistentVADWorkerClient:
 
     def close(self):
         with self._lock:
+            self._closed = True
             process = self._process
             self._terminate_locked(process, reason="close")
 
 
 class PersistentWhisperWorkerClient:
-    """Keeps Whisper/PyTorch in a separate process so native crashes do not kill the UI."""
+    """Keeps Bark/PyTorch in a separate process so native crashes do not kill the UI."""
 
     def __init__(self, worker_module: str, workdir: str, model_size: str, device: str, log_fn):
         self.worker_module = worker_module
@@ -636,6 +667,7 @@ class PersistentWhisperWorkerClient:
         self._ready_event = threading.Event()
         self._ready = False
         self._last_start_error = None
+        self._closed = False
         self._last_ready_payload = {}
         self._request_id = 0
 
@@ -659,6 +691,8 @@ class PersistentWhisperWorkerClient:
         self._last_ready_payload = {}
 
     def _start_locked(self):
+        if self._closed:
+            raise RuntimeError("Widget worker is closed")
         command = [
             sys.executable,
             "-u",
@@ -770,12 +804,12 @@ class PersistentWhisperWorkerClient:
             process = self._process
             if not ready:
                 self._terminate_locked(process, reason="startup_timeout")
-                raise RuntimeError(f"Whisper worker did not become ready within {timeout_seconds}s")
+                raise RuntimeError(f"Bark worker did not become ready within {timeout_seconds}s")
             if process is None or process.poll() is not None:
-                error = self._last_start_error or "Whisper worker exited during startup"
+                error = self._last_start_error or "Bark worker exited during startup"
                 raise RuntimeError(error)
             if not self._ready:
-                raise RuntimeError(self._last_start_error or "Whisper worker failed to start")
+                raise RuntimeError(self._last_start_error or "Bark worker failed to start")
             return dict(self._last_ready_payload)
 
     def is_ready(self):
@@ -791,11 +825,16 @@ class PersistentWhisperWorkerClient:
             process = self._process
             self._terminate_locked(process, reason=reason)
 
+    def reset_stream(self):
+        if self.is_ready():
+            self.transcribe("", {}, timeout_seconds=30, request_type="reset_stream")
+
     def transcribe(
         self,
         audio_path: str,
         options: dict,
         timeout_seconds: int = WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
+        request_type: str = "transcribe",
     ) -> dict:
         with self._request_lock:
             ready_timeout = min(
@@ -806,13 +845,13 @@ class PersistentWhisperWorkerClient:
             with self._lock:
                 process = self._process
                 if process is None or process.poll() is not None or not self._ready:
-                    raise RuntimeError("Whisper worker is not available")
+                    raise RuntimeError("Bark worker is not available")
 
                 self._request_id += 1
                 request_id = self._request_id
                 response_queue = self._response_queue
                 request = {
-                    "type": "transcribe",
+                    "type": request_type,
                     "request_id": request_id,
                     "audio_path": os.path.abspath(audio_path),
                     "options": options or {},
@@ -822,7 +861,7 @@ class PersistentWhisperWorkerClient:
                     process.stdin.flush()
                 except Exception as e:
                     self._terminate_locked(process, reason="request_send_failed")
-                    raise RuntimeError("Whisper worker pipe failed while sending request") from e
+                    raise RuntimeError("Bark worker pipe failed while sending request") from e
 
             deadline = time.monotonic() + timeout_seconds
             while True:
@@ -831,7 +870,7 @@ class PersistentWhisperWorkerClient:
                     with self._lock:
                         if self._is_current_process(process):
                             self._terminate_locked(process, reason="request_timeout")
-                    raise RuntimeError(f"Whisper worker timed out after {timeout_seconds}s")
+                    raise RuntimeError(f"Bark worker timed out after {timeout_seconds}s")
 
                 try:
                     message = response_queue.get(timeout=min(remaining, 0.25))
@@ -839,7 +878,7 @@ class PersistentWhisperWorkerClient:
                     with self._lock:
                         process_alive = self._is_current_process(process) and process.poll() is None
                     if not process_alive:
-                        raise RuntimeError(f"Whisper worker exited while processing audio (code {process.poll()})")
+                        raise RuntimeError(f"Bark worker exited while processing audio (code {process.poll()})")
                     continue
 
                 if message.get("request_id") != request_id:
@@ -851,7 +890,7 @@ class PersistentWhisperWorkerClient:
                     continue
 
                 if not message.get("ok"):
-                    error_text = message.get("error") or "Whisper worker reported an unknown error"
+                    error_text = message.get("error") or "Bark worker reported an unknown error"
                     raise RuntimeError(error_text)
 
                 return message
@@ -877,8 +916,12 @@ class PersistentWhisperWorkerClient:
 
         if process.poll() is None:
             try:
-                process.terminate()
-                process.wait(timeout=2.0)
+                if os.name == "nt":
+                    from app.bark_runtime import stop_owned_process
+                    stop_owned_process(process)
+                else:
+                    process.terminate()
+                    process.wait(timeout=2.0)
             except Exception:
                 pass
 
@@ -892,6 +935,7 @@ class PersistentWhisperWorkerClient:
 
     def close(self):
         with self._lock:
+            self._closed = True
             process = self._process
             self._terminate_locked(process, reason="close")
 
@@ -906,6 +950,7 @@ class ChunkCaptureSpooler:
         chunk_seconds: float,
         overlap_seconds: float,
         log_fn,
+        pause_detector=None,
     ):
         self.output_dir = output_dir
         self.sample_rate = int(sample_rate)
@@ -923,6 +968,10 @@ class ChunkCaptureSpooler:
         self.last_chunk_end_sample = 0
         self.next_chunk_index = 0
         self.chunks = []
+        self.pause_detector = pause_detector
+        self.pause_policy = (PauseBoundaryPolicy(self.sample_rate, target_seconds=chunk_seconds)
+                             if pause_detector is not None else None)
+        self.pause_search_enabled = lambda: True
 
     def add_frame(self, data: bytes):
         if not data:
@@ -941,6 +990,7 @@ class ChunkCaptureSpooler:
                 start_sample=self.buffer_start_sample,
                 end_sample=self.total_samples_received,
                 is_final=True,
+                boundary={"reason": "recording_stop"},
             )
         return list(self.chunks)
 
@@ -949,22 +999,50 @@ class ChunkCaptureSpooler:
         while self.total_samples_received - self.buffer_start_sample >= self.chunk_samples:
             start_sample = self.buffer_start_sample
             end_sample = start_sample + self.chunk_samples
+            overlap = self.overlap_samples
+            boundary = {"reason": "forced_overlap", "decision_sample": self.total_samples_received}
+            if self.pause_detector is not None:
+                policy = self.pause_policy
+                available = self.total_samples_received - start_sample
+                candidate = None
+                if (available >= policy.next_probe or available >= policy.maximum) and self.pause_search_enabled():
+                    observed = min(available, policy.maximum)
+                    pcm = bytes(self.buffer[:observed * self.bytes_per_sample_frame])
+                    try:
+                        pauses = self.pause_detector(pcm, self.sample_rate)
+                        candidate = policy.choose_pause(pauses, observed)
+                    except Exception as exc:
+                        # Capture remains intact; the bounded overlap fallback is safe.
+                        self.log_fn("pause_detection_failed", error=exc)
+                    policy.next_probe = available + policy.probe_interval
+                if candidate:
+                    relative_cut, pause = candidate
+                    end_sample = start_sample + relative_cut
+                    overlap = 0
+                    boundary.update(reason="confirmed_pause", **{
+                        key: start_sample + value for key, value in pause.items()
+                    })
+                elif available < policy.maximum:
+                    break
             chunk = self._write_chunk(
                 start_sample=start_sample,
                 end_sample=end_sample,
                 is_final=False,
+                boundary=boundary,
             )
             written.append(chunk)
 
-            keep_start_sample = end_sample - self.overlap_samples
+            keep_start_sample = end_sample - overlap
             drop_samples = keep_start_sample - self.buffer_start_sample
             drop_bytes = drop_samples * self.bytes_per_sample_frame
             del self.buffer[:drop_bytes]
             self.buffer_start_sample = keep_start_sample
+            if self.pause_policy is not None:
+                self.pause_policy.next_probe = self.pause_policy.target
 
         return written
 
-    def _write_chunk(self, start_sample: int, end_sample: int, is_final: bool):
+    def _write_chunk(self, start_sample: int, end_sample: int, is_final: bool, boundary=None):
         sample_count = max(0, end_sample - start_sample)
         byte_count = sample_count * self.bytes_per_sample_frame
         chunk_audio = bytes(self.buffer[:byte_count])
@@ -986,6 +1064,8 @@ class ChunkCaptureSpooler:
             "end_sample": end_sample,
             "seconds": sample_count / self.sample_rate,
             "is_final": is_final,
+            "overlap_previous_samples": max(0, self.last_chunk_end_sample - start_sample),
+            "boundary": boundary or {"reason": "legacy_overlap"},
         }
         self.chunks.append(chunk)
         self.last_chunk_end_sample = max(self.last_chunk_end_sample, end_sample)
@@ -998,6 +1078,8 @@ class ChunkCaptureSpooler:
             end_sample=end_sample,
             seconds=f"{chunk['seconds']:.3f}",
             final=is_final,
+            overlap_previous_samples=chunk["overlap_previous_samples"],
+            boundary=chunk["boundary"],
         )
         return chunk
 
@@ -1059,7 +1141,7 @@ class WhisperWidget(ctk.CTk):
             transcribe_timeout_seconds=WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
         )
         # Window Setup
-        self.title("Whisper")
+        self.title("Bark")
         self.geometry("120x150+50+50") # Circle plus status/copy footer
         self.resizable(False, False)
         self.attributes("-topmost", True) # Always on top
@@ -1142,6 +1224,10 @@ class WhisperWidget(ctk.CTk):
         )
         self.record_btn.grid(row=0, column=0, padx=10, pady=10)
 
+        # Identify the backend while retaining the original compact widget layout.
+        self.model_label = ctk.CTkLabel(self, text="Bark", height=12, font=("Arial", 9))
+        self.model_label.place(relx=0.5, y=0, anchor="n")
+
         # Mute Indicator (Overlay)
         self.mute_label = ctk.CTkLabel(self, text="", font=("Arial", 20), bg_color="transparent", text_color="red")
         self.mute_label.place(relx=0.8, rely=0.2, anchor="center")
@@ -1170,6 +1256,9 @@ class WhisperWidget(ctk.CTk):
         self.register_hotkey()
         self.reassert_topmost()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.exit_menu = tk.Menu(self, tearoff=0)
+        self.exit_menu.add_command(label="Close Bark", command=self.on_close)
+        self.bind("<Button-3>", lambda event: self.exit_menu.tk_popup(event.x_root, event.y_root))
         self.start_web_server()
         self.log_event("app_ready")
         self.write_runtime_heartbeat(reason="app_ready")
@@ -1260,6 +1349,23 @@ class WhisperWidget(ctk.CTk):
             self.log_event("web_widget_server_stop_failed", error=e)
         finally:
             self.web_server = None
+
+    def processing_started(self, reason):
+        self.is_processing = True
+        self.ui_call(self.update_ui_state, "processing")
+        self.write_runtime_heartbeat(reason=reason)
+
+    def processing_finished(self):
+        self.is_processing = False
+        self.ui_call(self.update_ui_state, "ready")
+        self.write_runtime_heartbeat(reason="web_processing_finished")
+
+    def find_pauses(self, wav_path):
+        with wave.open(wav_path, "rb") as reader:
+            if (reader.getnchannels(), reader.getsampwidth(), reader.getframerate()) != (1, 2, SAMPLE_RATE):
+                raise ValueError("Pause analysis requires mono PCM16 at 16 kHz")
+            pcm = reader.readframes(reader.getnframes())
+        return self.vad_client.find_pauses(pcm, SAMPLE_RATE)
 
     def web_status_payload(self):
         ready_payload = self.whisper_client.ready_payload()
@@ -1412,6 +1518,12 @@ class WhisperWidget(ctk.CTk):
 
         if chunk_candidates:
             chunk_candidates.sort(key=lambda item: item["index"])
+            previous_end = 0
+            for chunk in chunk_candidates:
+                # Filenames retain exact sample ranges even after an interrupted run.
+                chunk["overlap_previous_samples"] = max(0, previous_end - chunk["start_sample"])
+                chunk["boundary"] = {"reason": "recovered"}
+                previous_end = chunk["end_sample"]
             if chunk_candidates:
                 chunk_candidates[-1]["is_final"] = True
             return {
@@ -1503,7 +1615,7 @@ class WhisperWidget(ctk.CTk):
             self.cleanup_chunked_temp_dir(keep=False, reason="recording_start")
             temp_dir = self.prepare_chunked_temp_dir()
             sample_width = self.p.get_sample_size(pyaudio.paInt16)
-            self.chunk_spooler = ChunkCaptureSpooler(
+            spooler = ChunkCaptureSpooler(
                 output_dir=temp_dir,
                 sample_rate=SAMPLE_RATE,
                 channels=CHANNELS,
@@ -1511,15 +1623,24 @@ class WhisperWidget(ctk.CTk):
                 chunk_seconds=CHUNKED_CHUNK_SECONDS,
                 overlap_seconds=CHUNKED_OVERLAP_SECONDS,
                 log_fn=self.log_chunk_event,
+                pause_detector=self.vad_client.find_pauses,
             )
             self.start_chunk_transcription_queue()
+            from app.buffered_audio import BufferedAudioSpooler
+
+            spooler = BufferedAudioSpooler(spooler)
+            self.chunk_spooler = BackgroundChunkCapture(spooler, self.accept_captured_chunks)
             self.log_chunk_event(
                 "capture_started",
                 chunk_seconds=CHUNKED_CHUNK_SECONDS,
                 overlap_seconds=CHUNKED_OVERLAP_SECONDS,
+                pause_seconds=0.8,
+                earliest_seconds=20,
+                maximum_seconds=40,
                 sample_rate=SAMPLE_RATE,
                 channels=CHANNELS,
                 sample_width=sample_width,
+                buffered=True,
             )
             self.update_recovery_state(
                 active=True,
@@ -1536,35 +1657,28 @@ class WhisperWidget(ctk.CTk):
             return
 
         try:
-            chunks = self.chunk_spooler.add_frame(data)
-            for chunk in chunks:
-                self.chunk_capture_chunks.append(chunk)
-                if not self.enqueue_chunk_for_transcription(chunk):
-                    self.chunk_pipeline_failed = True
-            if chunks:
-                self.update_recovery_state(
-                    active=True,
-                    mode="chunked",
-                    stage="recording",
-                    chunk_count=len(self.chunk_capture_chunks),
-                )
+            self.chunk_spooler.add_frame(data)
         except Exception as e:
             self.log_chunk_event("capture_frame_failed", error=e)
-            self.chunk_spooler = None
             self.chunk_pipeline_failed = True
+
+    def accept_captured_chunks(self, chunks):
+        for chunk in chunks:
+            self.chunk_capture_chunks.append(chunk)
+            if not self.shutdown_event.is_set() and not self.enqueue_chunk_for_transcription(chunk):
+                self.chunk_pipeline_failed = True
+        if chunks:
+            self.update_recovery_state(
+                active=True, mode="chunked", stage="recording",
+                chunk_count=len(self.chunk_capture_chunks),
+            )
 
     def finalize_chunk_capture(self, reason="recording_stop"):
         if self.chunk_spooler is None:
             return []
 
         try:
-            existing_chunks = len(self.chunk_capture_chunks)
-            all_chunks = self.chunk_spooler.finalize()
-            new_chunks = all_chunks[existing_chunks:]
-            for chunk in new_chunks:
-                self.chunk_capture_chunks.append(chunk)
-                if not self.enqueue_chunk_for_transcription(chunk):
-                    self.chunk_pipeline_failed = True
+            self.chunk_spooler.finalize()
             self.log_chunk_event(
                 "capture_finalized",
                 chunks=len(self.chunk_capture_chunks),
@@ -1590,14 +1704,10 @@ class WhisperWidget(ctk.CTk):
         return f"{root}_{suffix}.wav"
 
     def base_transcribe_options(self):
-        return {
-            "condition_on_previous_text": False,
-            "language": WHISPER_LANGUAGE,
-            "logprob_threshold": -1.0,
-            "no_speech_threshold": WHISPER_NO_SPEECH_THRESHOLD,
-        }
+        return {"language": WHISPER_LANGUAGE}
 
     def process_chunk_audio(self, chunk):
+        """Preserve the entire captured chunk, including pauses and speech edges."""
         chunk_index = chunk.get("index")
         source_path = chunk["path"]
         started = time.perf_counter()
@@ -1605,7 +1715,9 @@ class WhisperWidget(ctk.CTk):
             "ok": False,
             "chunk_index": chunk_index,
             "source_path": source_path,
-            "speech_secs": 0.0,
+            "speech_secs": None,
+            "audio_seconds": None,
+            "silence_trimmed": False,
             "processed_path": None,
             "no_speech": False,
             "error": None,
@@ -1614,48 +1726,17 @@ class WhisperWidget(ctk.CTk):
 
         self.log_chunk_event("processing_start", chunk_index=chunk_index, file=source_path)
         try:
-            speech_path = self.chunk_artifact_path(chunk, "speech_only")
-
-            vad_started = time.perf_counter()
-            speech_secs = self.vad_client.run(
-                in_wav_path=source_path,
-                out_wav_path=speech_path,
-                sample_rate=SAMPLE_RATE,
-                pad_ms=VAD_PAD_MS,
-                min_speech_ms=VAD_MIN_SPEECH_MS,
-                merge_gap_ms=VAD_MERGE_GAP_MS,
-                speech_prob_threshold=0.5,
-            )
-            vad_seconds = time.perf_counter() - vad_started
-            result["speech_secs"] = speech_secs
-            result["timings"]["vad_seconds"] = vad_seconds
-            self.log_chunk_event(
-                "vad_complete",
-                chunk_index=chunk_index,
-                speech_secs=f"{speech_secs:.3f}",
-                processing_seconds=f"{vad_seconds:.3f}",
-            )
-
-            if speech_secs <= 0.0:
-                result["ok"] = True
-                result["no_speech"] = True
-                result["timings"]["total_seconds"] = time.perf_counter() - started
-                self.log_chunk_event(
-                    "processing_complete",
-                    chunk_index=chunk_index,
-                    no_speech=True,
-                    total_seconds=f"{result['timings']['total_seconds']:.3f}",
-                )
-                return result
-
-            processed_source = speech_path
+            with wave.open(source_path, "rb") as source:
+                result["audio_seconds"] = source.getnframes() / source.getframerate()
             result["ok"] = True
-            result["processed_path"] = processed_source
+            result["processed_path"] = source_path
             result["timings"]["total_seconds"] = time.perf_counter() - started
             self.log_chunk_event(
                 "processing_complete",
                 chunk_index=chunk_index,
-                file=processed_source,
+                file=source_path,
+                audio_seconds=result["audio_seconds"],
+                silence_trimmed=False,
                 no_speech=False,
                 total_seconds=f"{result['timings']['total_seconds']:.3f}",
             )
@@ -1738,6 +1819,11 @@ class WhisperWidget(ctk.CTk):
             "chunk_index": chunk_index,
             "text": "",
             "source_path": chunk.get("path"),
+            "start_sample": chunk.get("start_sample"),
+            "end_sample": chunk.get("end_sample"),
+            "overlap_previous_samples": chunk.get("overlap_previous_samples"),
+            "boundary": chunk.get("boundary"),
+            "buffered_request": chunk.get("buffered"),
             "transcribed_path": None,
             "processing": None,
             "error": None,
@@ -1752,7 +1838,7 @@ class WhisperWidget(ctk.CTk):
             return result
 
         transcribe_path = processing_result.get("processed_path")
-        stage = "processed_chunk"
+        stage = "raw_chunk"
         if not processing_result.get("ok") or not transcribe_path or not os.path.exists(transcribe_path):
             transcribe_path = chunk.get("path")
             stage = "raw_chunk_fallback"
@@ -1767,8 +1853,15 @@ class WhisperWidget(ctk.CTk):
             self.log_chunk_event("whisper_failed", chunk_index=chunk_index, stage=stage, error=result["error"])
             return result
 
+        options = self.base_transcribe_options()
+        if chunk.get("buffered") is not None:
+            transcribe_path = chunk.get("context_path", chunk["path"])
+            options["buffered"] = chunk["buffered"]
+            stage = "buffered_context"
         result["transcribed_path"] = transcribe_path
-        max_attempts = max(1, int(CHUNKED_WHISPER_MAX_ATTEMPTS))
+        # A restarted worker cannot continue a prior decoder state. A failed
+        # buffered request takes the existing complete-recording fallback.
+        max_attempts = 1 if "buffered" in options else max(1, int(CHUNKED_WHISPER_MAX_ATTEMPTS))
         request_timeout = min(
             WHISPER_TRANSCRIBE_TIMEOUT_SECONDS,
             max(10, CHUNKED_FINALIZE_TIMEOUT_SECONDS - 25),
@@ -1787,11 +1880,16 @@ class WhisperWidget(ctk.CTk):
                 started = time.perf_counter()
                 whisper_result = self.transcribe_with_whisper(
                     transcribe_path,
-                    self.base_transcribe_options(),
+                    options,
                     timeout_seconds=request_timeout,
                 )
                 elapsed = time.perf_counter() - started
                 text = (whisper_result.get("text") or "").strip()
+                if "buffered" in options:
+                    metadata = whisper_result.get("buffered")
+                    if not metadata or any(metadata.get(key) != value for key, value in options["buffered"].items()):
+                        raise RuntimeError("Worker did not acknowledge the buffered audio range")
+                    result["buffered"] = metadata
                 result["text"] = text
                 result["timings"]["whisper_seconds"] = elapsed
                 result["timings"]["whisper_attempts"] = whisper_attempt
@@ -1910,7 +2008,24 @@ class WhisperWidget(ctk.CTk):
             existing_text = existing_text.rstrip(".!?")
         return f"{existing_text} {remaining_next}"
 
-    def stitch_chunk_transcripts(self, chunk_results):
+    def stitch_chunk_transcripts(self, chunk_results, require_final=True):
+        ordered = sorted(chunk_results, key=lambda item: item.get("chunk_index", -1))
+        if any(row.get("buffered_request") is not None or row.get("buffered") for row in ordered):
+            previous_end = 0
+            stream_id = None
+            for index, row in enumerate(ordered):
+                metadata = row.get("buffered") or {}
+                stream_id = stream_id or metadata.get("stream_id")
+                if (not row.get("ok") or row.get("chunk_index") != index or metadata.get("index") != index or
+                        metadata.get("stream_id") != stream_id or
+                        metadata.get("core_start") != previous_end):
+                    raise RuntimeError("Incomplete buffered transcript; use recording fallback")
+                previous_end = metadata["core_end"]
+            if require_final and not ordered[-1]["buffered"].get("final"):
+                raise RuntimeError("Buffered transcription has not been finalized")
+            # Decode the complete carried token history once, without string
+            # overlap matching or insertion of spaces between subword pieces.
+            return ordered[-1]["buffered"]["cumulative_text"].strip()
         stitched = ""
         for result in sorted(chunk_results, key=lambda item: item.get("chunk_index", -1)):
             if not result.get("ok"):
@@ -1918,7 +2033,11 @@ class WhisperWidget(ctk.CTk):
             text = (result.get("text") or "").strip()
             if not text:
                 continue
-            stitched = self.merge_transcript_overlap(stitched, text)
+            if result.get("overlap_previous_samples") == 0:
+                stitched = f"{stitched} {text}".strip()
+            else:
+                # Older manifests and forced cuts retain the original deduplication.
+                stitched = self.merge_transcript_overlap(stitched, text)
         return stitched.strip()
 
     def copy_chunk_debug_artifacts(self, artifact_dir, chunk_results):
@@ -1937,8 +2056,11 @@ class WhisperWidget(ctk.CTk):
                 root, _ = os.path.splitext(source_path)
                 candidates.extend([
                     ("raw", source_path),
-                    ("speech_only", f"{root}_speech_only.wav"),
                 ])
+                # Older recovered chunks can still have extraction artifacts.
+                # Only describe them as current inputs for a legacy trimmed result.
+                if (result.get("processing") or {}).get("silence_trimmed") is not False:
+                    candidates.append(("speech_only", f"{root}_speech_only.wav"))
 
             processing = result.get("processing") or {}
             for label, path in (
@@ -2008,6 +2130,12 @@ class WhisperWidget(ctk.CTk):
                     "text": result.get("text") or "",
                     "chars": len(result.get("text") or ""),
                     "source_path": result.get("source_path"),
+                    "start_sample": result.get("start_sample"),
+                    "end_sample": result.get("end_sample"),
+                    "overlap_previous_samples": result.get("overlap_previous_samples"),
+                    "boundary": result.get("boundary"),
+                    "buffered_request": result.get("buffered_request"),
+                    "buffered": result.get("buffered"),
                     "transcribed_path": result.get("transcribed_path"),
                     "error": result.get("error"),
                     "timings": result.get("timings") or {},
@@ -2016,6 +2144,8 @@ class WhisperWidget(ctk.CTk):
                         "ok": processing.get("ok"),
                         "no_speech": processing.get("no_speech"),
                         "speech_secs": processing.get("speech_secs"),
+                        "audio_seconds": processing.get("audio_seconds"),
+                        "silence_trimmed": processing.get("silence_trimmed"),
                         "processed_path": processing.get("processed_path"),
                         "error": processing.get("error"),
                         "timings": processing.get("timings") or {},
@@ -2168,9 +2298,9 @@ class WhisperWidget(ctk.CTk):
         return True
 
     def load_model(self):
-        """Starts the persistent Whisper worker on a background thread."""
+        """Starts the persistent Bark worker on a background thread."""
         try:
-            print("Starting Whisper worker...")
+            print("Starting Bark Pro worker...")
             self.log_event(
                 "model_load_start",
                 device=WHISPER_DEVICE,
@@ -2192,7 +2322,7 @@ class WhisperWidget(ctk.CTk):
             if recovery_candidate is None:
                 self.ui_call(self.update_ui_state, "ready")
             print(
-                "Whisper worker ready "
+                "Bark Pro worker ready "
                 f"({ready_payload.get('device')}, {ready_payload.get('model_dtype')})."
             )
             self.log_event(
@@ -2429,7 +2559,8 @@ class WhisperWidget(ctk.CTk):
             self.log_event("hotkey_register_success", mode="win32", hotkey=HOTKEY)
             return
 
-        if keyboard is not None:
+        # Do not fall back to a keyboard hook that could share an already-owned F8.
+        if not IS_WINDOWS and keyboard is not None:
             try:
                 keyboard.add_hotkey(HOTKEY, self.on_hotkey_pressed)
                 self.hotkey_mode = "keyboard"
@@ -2642,64 +2773,14 @@ class WhisperWidget(ctk.CTk):
 
         return b''.join(audio_data)
 
-    def build_transcribe_attempts(self, speech_secs, processed_source):
+    def build_transcribe_attempts(self):
         return self.build_transcribe_attempts_for_paths(
             raw_path=self.temp_filename,
-            speech_path=self.temp_speech_filename,
-            speech_secs=speech_secs,
-            processed_source=processed_source,
         )
 
-    def build_transcribe_attempts_for_paths(
-        self,
-        raw_path,
-        speech_path,
-        speech_secs,
-        processed_source=None,
-    ):
-        base_options = self.base_transcribe_options()
-        attempt_candidates = []
-        processed_source = processed_source or speech_path
-
-        if speech_secs > 0.0 and processed_source:
-            attempt_candidates.append(("speech_only_primary", processed_source, {}))
-            if processed_source != speech_path and speech_path and os.path.exists(speech_path):
-                attempt_candidates.append(("speech_only_raw_fallback", speech_path, {}))
-
-        attempt_candidates.append(("raw_full_fallback", raw_path, {}))
-        attempt_candidates.append((
-            "raw_full_permissive",
-            raw_path,
-            {
-                "compression_ratio_threshold": None,
-                "logprob_threshold": None,
-                "no_speech_threshold": None,
-            }
-        ))
-
-        attempts = []
-        seen = set()
-        for label, path, overrides in attempt_candidates:
-            if not path or not os.path.exists(path):
-                continue
-
-            signature = (
-                os.path.abspath(path),
-                tuple(sorted((key, repr(value)) for key, value in overrides.items())),
-            )
-            if signature in seen:
-                continue
-
-            seen.add(signature)
-            options = dict(base_options)
-            options.update(overrides)
-            attempts.append({
-                "label": label,
-                "path": path,
-                "options": options,
-            })
-
-        return attempts
+    def build_transcribe_attempts_for_paths(self, raw_path):
+        return [{"label": label, "path": raw_path, "options": self.base_transcribe_options()}
+                for label in ("original_audio", "original_audio_retry")]
 
     def save_debug_audio_files(self):
         if not SAVE_DEBUG_AUDIO:
@@ -2925,7 +3006,7 @@ class WhisperWidget(ctk.CTk):
         attempts_payload = []
         text = ""
         success = False
-        speech_secs = 0.0
+        speech_secs = None
         completed_attempts = 0
 
         try:
@@ -2944,41 +3025,10 @@ class WhisperWidget(ctk.CTk):
             shutil.copy2(wav_path, raw_path)
             self.log_event("web_transcription_source_staged", request_id=request_id, file=raw_path)
 
-            vad_started = time.perf_counter()
-            try:
-                speech_secs = self.vad_client.run(
-                    in_wav_path=raw_path,
-                    out_wav_path=speech_path,
-                    sample_rate=SAMPLE_RATE,
-                    pad_ms=VAD_PAD_MS,
-                    min_speech_ms=VAD_MIN_SPEECH_MS,
-                    merge_gap_ms=VAD_MERGE_GAP_MS,
-                    speech_prob_threshold=0.5,
-                )
-                timings["vad_seconds"] = time.perf_counter() - vad_started
-                self.log_event(
-                    "web_vad_complete",
-                    request_id=request_id,
-                    speech_secs=f"{speech_secs:.3f}",
-                    processing_seconds=f"{timings['vad_seconds']:.3f}",
-                )
-            except Exception as e:
-                timings["vad_seconds"] = time.perf_counter() - vad_started
-                speech_secs = -1.0
-                self.log_event("web_vad_failed_fallback_raw", request_id=request_id, error=e)
-
-            if speech_secs == 0.0:
-                self.log_event("web_vad_no_speech_detected", request_id=request_id)
-            elif speech_secs > 0.0:
-                self.log_event("web_vad_speech_source_ready", request_id=request_id, file=speech_path)
-
+            speech_secs = None  # No speech-only extraction or duration measurement.
+            self.log_event("web_audio_preserved", request_id=request_id, file=raw_path, silence_trimmed=False)
             debug_dir = self.save_web_debug_audio_files(raw_path, speech_path, request_id)
-            attempts = self.build_transcribe_attempts_for_paths(
-                raw_path=raw_path,
-                speech_path=speech_path,
-                speech_secs=speech_secs,
-                processed_source=speech_path if speech_secs > 0.0 else None,
-            )
+            attempts = self.build_transcribe_attempts_for_paths(raw_path=raw_path)
             whisper_total = 0.0
 
             for attempt_number, attempt in enumerate(attempts, start=1):
@@ -3221,7 +3271,7 @@ class WhisperWidget(ctk.CTk):
             self.status_label.configure(text="Loading...")
         elif state == "ready":
             self.record_btn.configure(text="READY", fg_color="#2e7d32", hover_color="#1b5e20", state="normal")
-            self.status_label.configure(text="Press F8")
+            self.status_label.configure(text="Press F8" if self.hotkey_mode else "Click READY")
         elif state == "recording":
             self.record_btn.configure(text="STOP", fg_color="#c62828", hover_color="#b71c1c")
             self.status_label.configure(text="Recording...")
@@ -3504,38 +3554,12 @@ class WhisperWidget(ctk.CTk):
             raw_backup_path=self.current_raw_backup_path,
         )
 
-        speech_secs = 0.0
-        processed_source = None
-        self.log_event("vad_start", file=self.temp_filename)
-        try:
-            speech_secs = self.vad_client.run(
-                in_wav_path=self.temp_filename,
-                out_wav_path=self.temp_speech_filename,
-                sample_rate=SAMPLE_RATE,
-                pad_ms=VAD_PAD_MS,
-                min_speech_ms=VAD_MIN_SPEECH_MS,
-                merge_gap_ms=VAD_MERGE_GAP_MS,
-                speech_prob_threshold=0.5,
-            )
-            self.log_event("vad_complete", speech_secs=f"{speech_secs:.3f}")
-        except Exception as e:
-            print(f"VAD failed, falling back to raw audio: {e}")
-            self.log_event("vad_failed_fallback_raw", error=e)
-            speech_secs = -1.0
-
+        self.log_event("transcription_audio_preserved", file=self.temp_filename, silence_trimmed=False)
         success = False
-
-        if speech_secs == 0.0:
-            print("No speech detected by VAD, trying fallback transcription.")
-            self.log_event("vad_no_speech_detected")
-        elif speech_secs > 0.0:
-            processed_source = self.temp_speech_filename
-            self.log_event("vad_speech_source_ready", file=processed_source)
-
         self.save_debug_audio_files()
 
         completed_attempts = 0
-        attempts = self.build_transcribe_attempts(speech_secs, processed_source)
+        attempts = self.build_transcribe_attempts()
 
         for attempt_number, attempt in enumerate(attempts, start=1):
             try:
@@ -3644,6 +3668,8 @@ class WhisperWidget(ctk.CTk):
         self.write_runtime_heartbeat(reason="processing_finished")
 
     def on_close(self):
+        if self.shutdown_event.is_set():
+            return
         self.log_event("app_close_start")
         if not self.is_recording and not self.is_processing:
             self.clear_recovery_state(reason="clean_shutdown")
@@ -3655,6 +3681,21 @@ class WhisperWidget(ctk.CTk):
             )
         self.write_runtime_heartbeat(status="stopping", reason="app_close_start")
         self.shutdown_event.set()
+        was_recording = self.is_recording
+        self.is_recording = False
+        if self.record_thread and self.record_thread is not threading.current_thread():
+            self.record_thread.join(timeout=2.0)
+        if was_recording and self.audio_frames:
+            # Retain the unfinished clip for the original startup recovery path.
+            with wave.open(self.temp_filename, "wb") as output:
+                output.setnchannels(CHANNELS)
+                output.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
+                output.setframerate(SAMPLE_RATE)
+                output.writeframes(b"".join(self.audio_frames))
+        if self.chunk_spooler is not None:
+            self.finalize_chunk_capture(reason="app_close")
+        if self.chunk_transcribe_queue is not None:
+            self.chunk_transcribe_queue.put(None)
         self.unregister_hotkey()
         self.stop_web_server()
         self.whisper_client.close()

@@ -4,6 +4,11 @@ This file applies to the whole repository.
 
 ## Environment
 - Use the repo-local virtual environment at `.venv`.
+- This branch is a portable Windows Bark source distribution. Do not introduce
+  workstation paths, GPU names/UUIDs, a mandatory CUDA wheel index, or private URLs.
+- Keep device/model selection configurable and preserve the original widget/API.
+- Dependencies use compatibility ranges. The Transformers range protects the
+  custom Parakeet decoder interfaces; widen it only with a decoder review.
 - Keep runtime dependencies in `requirements.txt`.
 - Keep developer-only verification tools in `requirements-dev.txt`.
 

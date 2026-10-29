@@ -13,9 +13,10 @@ same layout under the supplied directory.
 | `data/failed_recordings/` | Audio saved after a failed transcription |
 | `runtime/logs/` | Desktop and web event logs, supervisor log, Python fatal log |
 | `runtime/state/` | Widget heartbeat and recovery JSON |
-| `runtime/work/recording/` | Current raw and speech-only WAV files |
-| `runtime/work/chunks/` | Audio chunks for processing and interrupted-work recovery |
-| `runtime/work/web/` | Web upload and processing files |
+| `runtime/work/recording/` | Current raw WAV and any legacy recovery artifacts |
+| `runtime/work/chunks/` | Original capture chunks and separate buffered context WAVs |
+| `runtime/work/web/` | Web uploads, original PCM timelines, context files, and VAD-analysis work |
+| `runtime/work/web/session_state/` | Persistent remote session statuses; interrupted sessions retain their audio |
 
 Generated contents of `data/` and `runtime/` are ignored by Git. Each `data/`
 subfolder contains a tracked `*_will_appear_here.txt` placeholder so it exists
@@ -26,7 +27,8 @@ In particular, **do not delete `runtime/` to clear a cache**: its state and work
 directories can hold the only copy of an interrupted recording. Back up both
 directories together when preserving unfinished work.
 
-Model downloads remain in the libraries' user cache locations. Existing HTTPS
+Model downloads use the Hugging Face user cache or `BARK_MODEL_DIR`. Silero VAD
+weights come with its installed package. Existing HTTPS
 certificates under `sidecache/certs/` and environment settings are unchanged.
 
 ## Migrating an older checkout

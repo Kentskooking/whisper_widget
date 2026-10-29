@@ -38,6 +38,9 @@ env/
 ENV/
 .venv
 .ruff_cache/
+.runtime/
+/models/
+*.safetensors
 
 # IDE
 .vscode/

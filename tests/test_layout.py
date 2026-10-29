@@ -73,9 +73,9 @@ class LayoutTests(unittest.TestCase):
             try:
                 with patch("app.transcription_service.TranscriptionService", return_value=service):
                     standalone = importlib.import_module("app.web.standalone")
-                self.assertIn(b"Whisper Web", standalone.index().body)
+                self.assertIn(b"Bark Web", standalone.index().body)
                 embedded = importlib.import_module("app.web.embedded")
-                self.assertIn("Whisper Widget Web", embedded.INDEX_HTML)
+                self.assertIn("Bark Widget Web", embedded.INDEX_HTML)
                 self.assertIsNone(service.vad_client._process)
                 self.assertIsNone(service.whisper_client._process)
             finally:
